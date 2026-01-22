@@ -931,62 +931,58 @@ class TossGestureHTS:
         self.fig.tight_layout(pad=1.0)
 
     def on_chart_hover(self, event):
-        """차트 호버 이벤트"""
-        if event.inaxes != self.ax or self.df.empty:
+        if self.df.empty:
             return
-        
-        with suppress(Exception):
-            x_idx = int(round(event.xdata))
+
+        try:
+            # Tk 좌표 → Matplotlib 데이터 좌표 변환
+            canvas = self.canvas_agg
+            x_canvas = event.x
+            y_canvas = event.y
+
+            inv = self.ax.transData.inverted()
+            xdata, ydata = inv.transform((x_canvas, y_canvas))
+
+            x_idx = int(round(xdata))
+
             start_idx = int(self.view_offset)
             end_idx = min(start_idx + int(self.view_window), len(self.df))
             visible_df = self.df.iloc[start_idx:end_idx]
-            
-            if 0 <= x_idx < len(visible_df):
-                row = visible_df.iloc[x_idx]
-                
-                if "m" in self.current_interval:
-                    date_fmt = '%Y-%m-%d %H:%M'
-                elif self.current_interval == "1mo":
-                    date_fmt = '%Y년 %m월'
-                elif self.current_interval == "1y":
-                    date_fmt = '%Y년'
-                else:
-                    date_fmt = '%Y년 %m월 %d일'
-                
-                self.lbl_tt_date.config(text=visible_df.index[x_idx].strftime(date_fmt))
-                
-                self.lbl_tt_open.config(text=f"${row['Open']:,.2f}")
-                self.lbl_tt_high.config(text=f"${row['High']:,.2f}")
-                self.lbl_tt_low.config(text=f"${row['Low']:,.2f}")
-                
-                close_color = COLOR_TOSS_RED if row['Close'] >= row['Open'] else COLOR_TOSS_BLUE
-                self.lbl_tt_close.config(text=f"${row['Close']:,.2f}", fg=close_color)
-                
-                volume_text = self._format_volume(row['Volume'])
-                self.lbl_tt_volume.config(text=volume_text)
-                
-                widget_w = self.chart_widget.winfo_width()
-                tooltip_width = 200
-                
-                tx = event.x + 20
-                if tx + tooltip_width > widget_w:
-                    tx = event.x - tooltip_width - 20
-                
-                ty = max(10, event.y - 90)
-                
-                self.tooltip.place(x=tx, y=ty)
-                self.update_chart_view(highlight_idx=x_idx)
 
-    def _format_volume(self, volume):
-        """거래량 포맷팅"""
-        if volume >= 1_000_000_000:
-            return f"{volume/1_000_000_000:.2f}B"
-        elif volume >= 1_000_000:
-            return f"{volume/1_000_000:.2f}M"
-        elif volume >= 1_000:
-            return f"{volume/1_000:.2f}K"
-        else:
-            return f"{int(volume)}"
+            if not (0 <= x_idx < len(visible_df)):
+                self.tooltip.place_forget()
+                return
+
+            row = visible_df.iloc[x_idx]
+
+            # 날짜 포맷
+            if "m" in self.current_interval:
+                date_str = row.name.strftime("%Y-%m-%d %H:%M")
+            else:
+                date_str = row.name.strftime("%Y-%m-%d")
+
+            # 툴팁 텍스트 갱신
+            self.lbl_tt_date.config(text=date_str)
+            self.lbl_tt_open.config(text=f"{row['Open']:,.2f}")
+            self.lbl_tt_high.config(text=f"{row['High']:,.2f}")
+            self.lbl_tt_low.config(text=f"{row['Low']:,.2f}")
+            self.lbl_tt_close.config(text=f"{row['Close']:,.2f}")
+            self.lbl_tt_volume.config(text=f"{int(row['Volume']):,}")
+
+            # 툴팁 위치
+            px = event.x + 15
+            py = event.y + 15
+
+            self.tooltip.place(x=px, y=py)
+            self.update_chart_view(highlight_idx=x_idx)
+
+        except Exception:
+            self.tooltip.place_forget()
+
+
+    def on_chart_leave(self, event):
+        self.tooltip.place_forget()
+        self.update_chart_view()
 
     def on_chart_leave(self, event):
         """차트에서 마우스가 벗어났을 때"""
