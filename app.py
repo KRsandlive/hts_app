@@ -1,388 +1,443 @@
-# gesture_trading_hts.py
 import cv2
 import mediapipe as mp
 import time
 import threading
-import winsound
 import tkinter as tk
 from tkinter import ttk
+import yfinance as yf
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+import matplotlib.dates as mdates
 from PIL import Image, ImageTk
+import pandas as pd
 import numpy as np
-import collections
 
-# ------------------ 설정 ------------------
-CAM_W, CAM_H = 480, 360
-WINDOW_W, WINDOW_H = 1200, 700
+# ------------------ [설정] UI & 컬러 (Premium Toss Dark Theme) ------------------
+COLOR_BG = "#0F1419"        
+COLOR_CARD = "#1C2229"      
+COLOR_TEXT_MAIN = "#FFFFFF" 
+COLOR_TEXT_SUB = "#8B95A1"  
+COLOR_TOSS_BLUE = "#3182F6" 
+COLOR_TOSS_RED = "#F04452"  
+COLOR_DIVIDER = "#2C353F"   
 
-# 가격 시뮬레이션 (GBM)
-INIT_PRICE = 1100.0
-MU = 0.0001     # drift per tick
-SIGMA = 0.0025  # volatility per sqrt(tick)
-TICK_DT = 1.0/20.0  # 초당 업데이트(약 20Hz)
+CAM_W, CAM_H = 360, 220      
 
-# 주문 스텝
-STEP_NORMAL = 10
+class TossGestureHTS:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Toss Invest Pro")
+        self.root.geometry("1500x950")
+        self.root.configure(bg=COLOR_BG)
 
-# 사운드 쿨다운
-SND_COOLDOWN_INC = 0.15
-SND_COOLDOWN_DEC = 0.15
-SND_COOLDOWN_RESET = 0.5
-SND_COOLDOWN_TRADE = 1.0
+        # 데이터 및 상태 초기화
+        self.balance = 50000000
+        self.holdings = 0
+        self.symbol = "^GSPC" 
+        self.symbol_display = "S&P 500"
+        
+        self.current_interval = "1d" 
+        self.fetch_period = "max"     
+        self.chart_type = "line" # 'line' or 'bar'
+        
+        self.df = pd.DataFrame()
+        self.current_price = 0.0
+        self.prev_close = 0.0
+        self.order_amount = 0
+        
+        self.view_offset = 0  
+        self.view_window = 60 
+        
+        self.right_fist_start = None
+        self.left_fist_start = None
+        self.STEP = 5 
 
-# 체결 팝업 지속시간 (ms)
-POPUP_DURATION = 2000
+        # Vision 엔진
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
+        self.cap = cv2.VideoCapture(0)
 
-# ------------------ Mediapipe 초기화 ------------------
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
+        self.init_ui()
+        self.change_unit("1d", "일봉")
+        self.main_loop()
 
-# ------------------ 상태 변수 ------------------
-current_price = INIT_PRICE
-order_amount = int(INIT_PRICE)
-price_history = collections.deque(maxlen=300)  # 화면에 보일 최근 가격
-price_history.append(current_price)
+    def draw_round_rect(self, canvas, color, radius=35):
+        canvas.update()
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        canvas.delete("round_rect")
+        canvas.create_oval(0, 0, radius*2, radius*2, fill=color, outline=color, tags="round_rect")
+        canvas.create_oval(w-radius*2, 0, w, radius*2, fill=color, outline=color, tags="round_rect")
+        canvas.create_oval(0, h-radius*2, radius*2, h, fill=color, outline=color, tags="round_rect")
+        canvas.create_oval(w-radius*2, h-radius*2, w, h, fill=color, outline=color, tags="round_rect")
+        canvas.create_rectangle(radius, 0, w-radius, h, fill=color, outline=color, tags="round_rect")
+        canvas.create_rectangle(0, radius, w, h-radius, fill=color, outline=color, tags="round_rect")
 
-# 제스처 상태 유지 (필수 — 절대 삭제 금지)
-right_fist_start = None
-left_fist_start = None
-transaction_message = ""
-transaction_time = None
+    def init_ui(self):
+        self.main_container = tk.Frame(self.root, bg=COLOR_BG, padx=40, pady=30)
+        self.main_container.pack(fill='both', expand=True)
 
-# 사운드 타이밍
-last_inc_sound = 0.0
-last_dec_sound = 0.0
-last_reset_sound = 0.0
-last_trade_sound = 0.0
+        # --- [LEFT PANEL] ---
+        self.side_panel = tk.Frame(self.main_container, bg=COLOR_BG, width=420)
+        self.side_panel.pack(side='left', fill='y')
+        self.side_panel.pack_propagate(False)
 
-# 카메라
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+        # 1. 시세 정보 카드
+        self.info_canvas = tk.Canvas(self.side_panel, bg=COLOR_BG, highlightthickness=0, height=200)
+        self.info_canvas.pack(fill='x', pady=(0, 16))
+        self.draw_round_rect(self.info_canvas, COLOR_CARD)
+        
+        tk.Label(self.info_canvas, text=self.symbol_display, font=("Malgun Gothic", 18, "bold"), bg=COLOR_CARD, fg=COLOR_TEXT_MAIN).place(x=30, y=25)
+        self.lbl_price = tk.Label(self.info_canvas, text="0.00", font=("Segoe UI", 32, "bold"), bg=COLOR_CARD, fg=COLOR_TOSS_RED)
+        self.lbl_price.place(x=28, y=65)
+        self.lbl_change = tk.Label(self.info_canvas, text="+0.00 (+0.00%)", font=("Malgun Gothic", 11), bg=COLOR_CARD, fg=COLOR_TOSS_RED)
+        self.lbl_change.place(x=32, y=125)
 
-# ------------------ 사운드 유틸 ------------------
-def _async(fn):
-    threading.Thread(target=fn, daemon=True).start()
+        # 2. 내 자산 카드
+        self.asset_canvas = tk.Canvas(self.side_panel, bg=COLOR_BG, highlightthickness=0, height=140)
+        self.asset_canvas.pack(fill='x', pady=(0, 16))
+        self.draw_round_rect(self.asset_canvas, COLOR_CARD)
+        
+        tk.Label(self.asset_canvas, text="내 투자 원금", font=("Malgun Gothic", 10), bg=COLOR_CARD, fg=COLOR_TEXT_SUB).place(x=30, y=20)
+        self.lbl_balance = tk.Label(self.asset_canvas, text=f"{self.balance:,}원", font=("Segoe UI", 20, "bold"), bg=COLOR_CARD, fg=COLOR_TEXT_MAIN)
+        self.lbl_balance.place(x=30, y=45)
+        self.lbl_holdings_info = tk.Label(self.asset_canvas, text=f"0주 보유 중", font=("Malgun Gothic", 10), bg=COLOR_CARD, fg=COLOR_TOSS_BLUE)
+        self.lbl_holdings_info.place(x=32, y=95)
 
-def snd_inc(): winsound.Beep(1300, 60)
-def snd_dec(): winsound.Beep(500, 60)
-def snd_reset(): winsound.Beep(750, 120)
-def snd_trade():
-    winsound.Beep(700, 100)
-    winsound.Beep(1000, 140)
-    winsound.Beep(1300, 180)
+        # 3. 비전 카메라 카드
+        self.vision_canvas = tk.Canvas(self.side_panel, bg=COLOR_BG, highlightthickness=0, height=260)
+        self.vision_canvas.pack(fill='x', pady=(0, 16))
+        self.draw_round_rect(self.vision_canvas, COLOR_CARD)
+        self.lbl_cam = tk.Label(self.vision_canvas, bg='black', bd=0)
+        self.lbl_cam.place(relx=0.5, rely=0.5, anchor='center', width=CAM_W, height=CAM_H)
 
-# ------------------ 제스처 판별 (원본 유지) ------------------
-def detect_fist(hand_landmarks):
-    tips = [4, 8, 12, 16, 20]
-    folded = 0
-    for tip_id in tips:
-        tip = hand_landmarks.landmark[tip_id]
-        pip = hand_landmarks.landmark[tip_id - 2]
-        if tip.y > pip.y:
-            folded += 1
-    return folded >= 4
+        # 4. 주문 패널
+        self.order_canvas = tk.Canvas(self.side_panel, bg=COLOR_BG, highlightthickness=0, height=220)
+        self.order_canvas.pack(fill='x')
+        self.draw_round_rect(self.order_canvas, COLOR_CARD)
+        
+        tk.Label(self.order_canvas, text="설정 주문가 ($)", font=("Malgun Gothic", 10, "bold"), bg=COLOR_CARD, fg=COLOR_TEXT_SUB).place(relx=0.5, y=30, anchor='center')
+        self.ent_order = tk.Entry(self.order_canvas, font=("Segoe UI", 28, "bold"), bg=COLOR_CARD, fg=COLOR_TOSS_BLUE, bd=0, justify='center', width=10)
+        self.ent_order.place(relx=0.5, y=75, anchor='center')
+        
+        self.btn_buy = tk.Button(self.order_canvas, text="살래요", bg=COLOR_TOSS_RED, fg='white', font=("Malgun Gothic", 14, "bold"), relief='flat', command=lambda: self.execute_trade("BUY"))
+        self.btn_buy.place(x=25, y=140, width=175, height=55)
+        self.btn_sell = tk.Button(self.order_canvas, text="팔래요", bg=COLOR_TOSS_BLUE, fg='white', font=("Malgun Gothic", 14, "bold"), relief='flat', command=lambda: self.execute_trade("SELL"))
+        self.btn_sell.place(x=220, y=140, width=175, height=55)
 
-def detect_open_palm(hand_landmarks):
-    tips = [8, 12, 16, 20]
-    extended = 0
-    for tip_id in tips:
-        tip = hand_landmarks.landmark[tip_id]
-        pip = hand_landmarks.landmark[tip_id - 2]
-        if tip.y < pip.y:
-            extended += 1
-    return extended >= 4
+        # --- [RIGHT PANEL] ---
+        self.content_panel = tk.Frame(self.main_container, bg=COLOR_BG)
+        self.content_panel.pack(side='right', fill='both', expand=True, padx=(40, 0))
 
-def detect_price_gesture(hand_landmarks):
-    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-    middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-    if index_tip.y < middle_tip.y:
-        return "INC"
-    elif index_tip.y > middle_tip.y:
-        return "DEC"
-    return None
+        # 차트 카드
+        self.chart_card = tk.Frame(self.content_panel, bg=COLOR_CARD)
+        self.chart_card.pack(fill='both', expand=True)
 
-# ------------------ GUI 세팅 ------------------
-root = tk.Tk()
-root.title("HTS-like Gesture Trading")
-root.geometry(f"{WINDOW_W}x{WINDOW_H}")
-root.configure(bg="#0f1724")  # 진한 배경
+        self.fig = Figure(figsize=(10, 6), dpi=100, facecolor=COLOR_CARD)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(COLOR_CARD)
+        self.canvas_agg = FigureCanvasTkAgg(self.fig, master=self.chart_card)
+        self.chart_widget = self.canvas_agg.get_tk_widget()
+        self.chart_widget.config(bg=COLOR_CARD, highlightthickness=0)
+        self.chart_widget.pack(fill='both', expand=True, padx=5, pady=5)
 
-style = ttk.Style(root)
-style.theme_use('clam')
-style.configure('TFrame', background='#0f1724')
-style.configure('Title.TLabel', background='#0f1724', foreground='#E6DB74', font=('Segoe UI', 14, 'bold'))
-style.configure('Small.TLabel', background='#0f1724', foreground='#E5E7EB', font=('Segoe UI', 10))
-style.configure('Green.TButton', foreground='white', background='#16A34A', font=('Segoe UI', 11, 'bold'))
-style.map('Green.TButton', background=[('active','#13803f')])
-style.configure('Red.TButton', foreground='white', background='#DC2626', font=('Segoe UI', 11, 'bold'))
-style.map('Red.TButton', background=[('active','#b22222')])
+        # 툴팁 UI
+        self.tooltip = tk.Frame(self.chart_widget, bg="#333D4B", padx=12, pady=12, highlightthickness=1, highlightbackground=COLOR_DIVIDER)
+        self.lbl_tt_date = tk.Label(self.tooltip, text="", font=("Malgun Gothic", 9, "bold"), bg="#333D4B", fg=COLOR_TEXT_SUB)
+        self.lbl_tt_date.pack(anchor='w')
+        self.lbl_tt_price = tk.Label(self.tooltip, text="", font=("Segoe UI", 14, "bold"), bg="#333D4B", fg=COLOR_TEXT_MAIN)
+        self.lbl_tt_price.pack(anchor='w')
+        self.lbl_tt_detail = tk.Label(self.tooltip, text="", font=("Malgun Gothic", 8), bg="#333D4B", fg=COLOR_TEXT_SUB, justify='left')
+        self.lbl_tt_detail.pack(anchor='w', pady=(5, 0))
+        
+        self.chart_widget.bind("<Motion>", self.on_chart_hover)
+        self.chart_widget.bind("<MouseWheel>", self.on_chart_scroll)
+        self.chart_widget.bind("<Leave>", self.on_chart_leave)
 
-main_frame = ttk.Frame(root)
-main_frame.pack(fill='both', expand=True, padx=12, pady=12)
+        # 컨트롤 및 슬라이더
+        self.bottom_frame = tk.Frame(self.content_panel, bg=COLOR_BG)
+        self.bottom_frame.pack(fill='x', pady=(20, 0))
 
-# 왼쪽: 차트 패널
-left_panel = ttk.Frame(main_frame, width=600, height=700)
-left_panel.pack(side='left', fill='both', expand=True, padx=(0,8))
+        self.chart_slider = ttk.Scale(self.bottom_frame, from_=0, to=100, orient='horizontal', command=self.on_slider_move)
+        self.chart_slider.pack(fill='x', pady=(0, 15))
 
-# 차트 타이틀 & 현재가
-title_frame = ttk.Frame(left_panel)
-title_frame.pack(fill='x', pady=(4,6))
-title_lbl = ttk.Label(title_frame, text="Price Chart (Simulated)", style='Title.TLabel')
-title_lbl.pack(side='left')
-cur_price_lbl = ttk.Label(title_frame, text=f"Current Price: {int(current_price)}", style='Title.TLabel')
-cur_price_lbl.pack(side='right')
+        self.control_bar = tk.Frame(self.bottom_frame, bg=COLOR_BG)
+        self.control_bar.pack(fill='x')
+        
+        # 주기 변경 버튼 (정확한 단위 적용)
+        # 1y: 년봉, 1mo: 월봉, 1wk: 주봉, 1d: 일봉
+        units = [("년봉", "1y"), ("월봉", "1mo"), ("주봉", "1wk"), ("일봉", "1d")]
+        self.unit_btns = {}
+        for text, code in units:
+            btn = tk.Button(self.control_bar, text=text, font=("Malgun Gothic", 10, "bold"), bg=COLOR_DIVIDER, fg=COLOR_TEXT_SUB, bd=0, padx=15, pady=8, command=lambda c=code, t=text: self.change_unit(c, t))
+            btn.pack(side='left', padx=3)
+            self.unit_btns[text] = btn
 
-# Matplotlib figure
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-fig = Figure(figsize=(6,4), dpi=100, facecolor='#0f1724')
-ax = fig.add_axes([0.06,0.12,0.92,0.82], facecolor='#071122')
-ax.tick_params(axis='x', colors='#cbd5e1')
-ax.tick_params(axis='y', colors='#cbd5e1')
-ax.spines['bottom'].set_color('#334155')
-ax.spines['left'].set_color('#334155')
-ax.spines['top'].set_visible(False)
-ax.spines['right'].set_visible(False)
-line, = ax.plot([], [], linewidth=1.4)
+        self.min_var = tk.StringVar(value="분봉")
+        min_options = ["1m", "5m", "15m", "60m"]
+        self.min_menu = tk.OptionMenu(self.control_bar, self.min_var, *min_options, command=lambda v: self.change_unit(v, f"{v}분"))
+        self.min_menu.config(bg=COLOR_DIVIDER, fg=COLOR_TEXT_SUB, font=("Malgun Gothic", 9), relief='flat', bd=0)
+        self.min_menu.pack(side='left', padx=10)
 
-canvas = FigureCanvasTkAgg(fig, master=left_panel)
-canvas.get_tk_widget().pack(fill='both', expand=True)
+        tk.Button(self.control_bar, text="선/봉 전환", font=("Malgun Gothic", 10), bg=COLOR_TOSS_BLUE, fg="white", bd=0, padx=15, pady=8, command=self.toggle_chart_type).pack(side='right')
 
-# 오른쪽: 카메라 + 주문 UI + 로그
-right_panel = ttk.Frame(main_frame, width=400)
-right_panel.pack(side='right', fill='y', expand=False)
+        self.toast = tk.Label(self.root, text="", font=("Malgun Gothic", 13, "bold"), bg=COLOR_TOSS_BLUE, fg="white", padx=40, pady=18)
 
-# 카메라 영역
-cam_box = ttk.Frame(right_panel)
-cam_box.pack(pady=6)
-camera_label = tk.Label(cam_box, bg='black')
-camera_label.pack()
+    def toggle_chart_type(self):
+        self.chart_type = "bar" if self.chart_type == "line" else "line"
+        self.update_chart_view()
 
-# 손 상태 인디케이터 (좌/우)
-hand_state_frame = ttk.Frame(right_panel)
-hand_state_frame.pack(pady=(6,12), fill='x')
-left_state_lbl = ttk.Label(hand_state_frame, text="Left Hand:", style='Small.TLabel')
-left_state_lbl.pack(side='left', padx=(0,6))
-left_state_canvas = tk.Canvas(hand_state_frame, width=16, height=16, bg='#0f1724', highlightthickness=0)
-left_state_canvas.pack(side='left')
-right_state_lbl = ttk.Label(hand_state_frame, text="Right Hand:", style='Small.TLabel')
-right_state_lbl.pack(side='left', padx=(12,6))
-right_state_canvas = tk.Canvas(hand_state_frame, width=16, height=16, bg='#0f1724', highlightthickness=0)
-right_state_canvas.pack(side='left')
+    def change_unit(self, interval, text):
+        self.current_interval = interval
+        # UI 업데이트
+        for t, btn in self.unit_btns.items():
+            btn.config(bg=COLOR_TOSS_BLUE if t == text else COLOR_DIVIDER, fg="white" if t == text else COLOR_TEXT_SUB)
+        
+        # yfinance 데이터 주기 보정
+        # 년봉: 1y 단위 데이터가 없으므로 1mo 데이터를 받아 연단위 Resample 하거나, 1y를 지원하는 API 사용
+        # 여기서는 yfinance의 최대치를 고려하여 period 설정
+        if interval == "1y": self.fetch_period = "max"
+        elif "m" in interval: self.fetch_period = "7d"
+        else: self.fetch_period = "max"
 
-# 주문 입력
-order_frame = ttk.Frame(right_panel)
-order_frame.pack(pady=8, fill='x')
-ttk.Label(order_frame, text="Order Amount:", style='Small.TLabel').pack(side='left')
-order_entry = ttk.Entry(order_frame, width=12, font=('Segoe UI', 11))
-order_entry.pack(side='left', padx=6)
-order_entry.insert(0, str(int(order_amount)))
+        threading.Thread(target=self.fetch_market_data, daemon=True).start()
 
-btns_frame = ttk.Frame(right_panel)
-btns_frame.pack(pady=6)
-buy_btn = ttk.Button(btns_frame, text="BUY", style='Green.TButton')
-sell_btn = ttk.Button(btns_frame, text="SELL", style='Red.TButton')
-buy_btn.pack(side='left', padx=6, ipadx=8)
-sell_btn.pack(side='left', padx=6, ipadx=8)
+    def fetch_market_data(self):
+        try:
+            ticker = yf.Ticker(self.symbol)
+            # 기본 데이터 호출
+            # 년봉(1y)은 yfinance 라이브러리에서 직접 interval='1y'를 지원하지 않는 경우가 많음
+            # 이 경우 1mo 데이터를 가져와서 연 단위로 리샘플링함
+            target_interval = self.current_interval
+            if self.current_interval == "1y": target_interval = "1mo"
 
-# 로그
-log_label = ttk.Label(right_panel, text="Trade Log", style='Small.TLabel')
-log_label.pack(pady=(12,0))
-log_box = tk.Text(right_panel, width=48, height=12, bg='#071122', fg='#cbd5e1', wrap='word')
-log_box.pack(pady=6)
+            data = ticker.history(period=self.fetch_period, interval=target_interval)
+            
+            if not data.empty:
+                if self.current_interval == "1y":
+                    # 연 단위 리샘플링 로직 (OHLCV 보존)
+                    data = data.resample('YE').agg({
+                        'Open': 'first',
+                        'High': 'max',
+                        'Low': 'min',
+                        'Close': 'last',
+                        'Volume': 'sum'
+                    })
+                
+                self.df = data
+                self.current_price = data['Close'].iloc[-1]
+                self.prev_close = data['Close'].iloc[-2] if len(data) > 1 else self.current_price
+                if self.order_amount == 0: self.order_amount = int(self.current_price)
+                
+                # 뷰 윈도우 초기화
+                self.view_window = min(len(self.df), 60)
+                self.view_offset = len(self.df) - self.view_window
+                self.root.after(0, self.update_ui_with_data)
+        except Exception as e:
+            print(f"Data Fetch Error: {e}")
 
-# 중앙 HTS 스타일 체결 팝업 (처음엔 숨김)
-popup_frame = tk.Frame(root, bg='#061426', bd=3, highlightthickness=2, highlightbackground='#FBBF24')
-popup_frame.place(relx=0.5, rely=0.45, anchor='center')
-popup_frame.lower()  # 숨김
-popup_frame_visible = False
+    def update_ui_with_data(self):
+        if self.df.empty: return
+        diff = self.current_price - self.prev_close
+        diff_pct = (diff / self.prev_close * 100)
+        color = COLOR_TOSS_RED if diff >= 0 else COLOR_TOSS_BLUE
+        self.lbl_price.config(text=f"{self.current_price:,.2f}", fg=color)
+        self.lbl_change.config(text=f"{diff:+,.2f} ({diff_pct:+.2f}%)", fg=color)
+        
+        self.ent_order.delete(0, 'end')
+        self.ent_order.insert(0, str(int(self.order_amount)))
+        
+        self.chart_slider.config(to=max(0, len(self.df) - self.view_window))
+        self.chart_slider.set(self.view_offset)
+        self.update_chart_view()
 
-popup_side_lbl = tk.Label(popup_frame, text="", font=('Segoe UI', 34, 'bold'), bg='#061426', fg='#F8FAFF')
-popup_price_lbl = tk.Label(popup_frame, text="", font=('Segoe UI', 20, 'bold'), bg='#061426', fg='#E6DB74')
-popup_amount_lbl = tk.Label(popup_frame, text="", font=('Segoe UI', 14), bg='#061426', fg='#cbd5e1')
-popup_side_lbl.pack(padx=30, pady=(18,6))
-popup_price_lbl.pack(padx=30)
-popup_amount_lbl.pack(padx=30, pady=(6,18))
+    def on_slider_move(self, val):
+        self.view_offset = int(float(val))
+        self.update_chart_view()
 
-# ------------------ 유틸리티 함수 ------------------
-def append_log(text):
-    ts = time.strftime("%H:%M:%S")
-    log_box.insert('end', f"[{ts}] {text}\n")
-    log_box.see('end')
+    def on_chart_scroll(self, event):
+        """휠 조작 즉시 그래프 갱신"""
+        zoom_step = max(1, int(self.view_window * 0.1)) # 현재 화면 크기의 10% 단위로 줌
+        if event.delta > 0: # Zoom In
+            new_window = max(5, self.view_window - zoom_step)
+            # 마우스 위치 기준으로 줌 하려면 추가 로직 필요하나, 현재는 끝지점 기준
+            self.view_offset += (self.view_window - new_window)
+            self.view_window = new_window
+        else: # Zoom Out
+            new_window = min(len(self.df), self.view_window + zoom_step)
+            self.view_offset = max(0, self.view_offset - (new_window - self.view_window))
+            self.view_window = new_window
+        
+        # 범위 이탈 방지
+        self.view_offset = max(0, min(self.view_offset, len(self.df) - self.view_window))
+        
+        # 즉시 업데이트
+        self.chart_slider.set(self.view_offset)
+        self.update_chart_view()
 
-def show_popup(side, price, amount):
-    """HTS 스타일 중앙 팝업을 띄움 (POPUP_DURATION ms 유지)"""
-    global popup_frame_visible
-    popup_side_lbl.config(text=side, fg=('#16A34A' if side == 'BUY' else '#DC2626'))
-    popup_price_lbl.config(text=f"@ {int(price)}")
-    popup_amount_lbl.config(text=f"Amount: {amount} USD")
-    popup_frame.lift()
-    popup_frame_visible = True
-    root.after(POPUP_DURATION, hide_popup)
+    def update_chart_view(self, highlight_idx=None):
+        if self.df.empty: return
+        start_idx = int(self.view_offset)
+        end_idx = start_idx + int(self.view_window)
+        visible_df = self.df.iloc[start_idx : end_idx]
+        
+        if visible_df.empty: return
 
-def hide_popup():
-    global popup_frame_visible
-    popup_frame.lower()
-    popup_frame_visible = False
+        self.ax.clear()
+        y_data = visible_df['Close'].values
+        x_indices = np.arange(len(visible_df))
+        x_dates = visible_df.index
+        
+        # Y축 스케일링: 가시 영역의 고가/저가 기준
+        v_min, v_max = visible_df['Low'].min(), visible_df['High'].max()
+        margin = (v_max - v_min) * 0.1
+        if margin == 0: margin = v_max * 0.01
+        self.ax.set_ylim(v_min - margin, v_max + margin)
+        self.ax.set_xlim(-0.5, len(visible_df) - 0.5)
 
-# ------------------ 트레이드 실행 ------------------
-def execute_trade(side, price):
-    global last_trade_sound
-    append_log(f"{side} executed @{int(price)}")
-    show_popup(side, price, order_entry.get())
-    # 사운드(쿨다운 확인)
-    now = time.time()
-    if now - last_trade_sound >= SND_COOLDOWN_TRADE:
-        _async(snd_trade)
-        last_trade_sound = now
+        if self.chart_type == "bar":
+            # 봉 그래프 (캔들스틱 스타일)
+            up_mask = visible_df['Close'] >= visible_df['Open']
+            colors = np.where(up_mask, COLOR_TOSS_RED, COLOR_TOSS_BLUE)
+            
+            # 심지(Shadow)
+            self.ax.bar(x_indices, visible_df['High'] - visible_df['Low'], bottom=visible_df['Low'], color=colors, width=0.08, linewidth=0)
+            # 몸통(Body)
+            body_bottom = np.where(up_mask, visible_df['Open'], visible_df['Close'])
+            body_height = np.abs(visible_df['Close'] - visible_df['Open']).clip(lower=margin*0.05) # 너무 얇으면 최소 두께 부여
+            self.ax.bar(x_indices, body_height, bottom=body_bottom, color=colors, width=0.7, linewidth=0)
+        else:
+            # 선 그래프
+            main_color = COLOR_TOSS_RED if y_data[-1] >= y_data[0] else COLOR_TOSS_BLUE
+            self.ax.plot(x_indices, y_data, color=main_color, linewidth=2.5, antialiased=True)
+            self.ax.fill_between(x_indices, y_data, v_min - margin, color=main_color, alpha=0.08)
+        
+        # 하단 날짜 표시 (언제인지)
+        tick_count = min(len(x_indices), 5)
+        tick_pos = np.linspace(0, len(x_indices)-1, tick_count, dtype=int)
+        
+        date_format = '%Y-%m-%d'
+        if self.current_interval == "1y": date_format = '%Y'
+        elif "m" in self.current_interval: date_format = '%H:%M'
+        
+        self.ax.set_xticks(tick_pos)
+        self.ax.set_xticklabels([x_dates[i].strftime(date_format) for i in tick_pos])
+        
+        # 가이드라인
+        if highlight_idx is not None:
+            self.ax.axvline(x=highlight_idx, color=COLOR_TEXT_SUB, alpha=0.3, linestyle='--', linewidth=1)
 
-# 버튼에 바인딩
-buy_btn.config(command=lambda: execute_trade("BUY", current_price))
-sell_btn.config(command=lambda: execute_trade("SELL", current_price))
+        # 스타일 마감
+        self.ax.spines['top'].set_visible(False)
+        self.ax.spines['right'].set_visible(False)
+        self.ax.spines['left'].set_visible(False)
+        self.ax.spines['bottom'].set_color(COLOR_DIVIDER)
+        self.ax.tick_params(colors=COLOR_TEXT_SUB, labelsize=8, length=0)
+        self.ax.grid(True, axis='y', color=COLOR_DIVIDER, alpha=0.1)
+        
+        self.fig.tight_layout(pad=1.0) 
+        self.canvas_agg.draw()
 
-# ------------------ 차트 업데이트 (GBM) ------------------
-def gbm_next_price(s0):
-    # 한 tick에서 GBM
-    z = np.random.normal()
-    s1 = s0 * np.exp((MU - 0.5*SIGMA**2)*TICK_DT + SIGMA * np.sqrt(TICK_DT) * z)
-    return max(1.0, s1)
+    def on_chart_hover(self, event):
+        if event.inaxes != self.ax or self.df.empty: 
+            return
+            
+        x_idx = int(round(event.xdata))
+        visible_df = self.df.iloc[int(self.view_offset):int(self.view_offset)+int(self.view_window)]
+        
+        if 0 <= x_idx < len(visible_df):
+            row = visible_df.iloc[x_idx]
+            # 툴팁 정보 업데이트
+            date_fmt = '%Y-%m-%d %H:%M' if "m" in self.current_interval else '%Y-%m-%d'
+            self.lbl_tt_date.config(text=visible_df.index[x_idx].strftime(date_fmt))
+            self.lbl_tt_price.config(text=f"${row['Close']:,.2f}", fg=COLOR_TOSS_RED if row['Close'] >= row['Open'] else COLOR_TOSS_BLUE)
+            self.lbl_tt_detail.config(text=f"시가: ${row['Open']:,.2f}  고가: ${row['High']:,.2f}\n저가: ${row['Low']:,.2f}  거래량: {int(row['Volume']):,}")
+            
+            # 위치 결정
+            widget_w = self.chart_widget.winfo_width()
+            tx = event.x + 20
+            if tx + 200 > widget_w: tx = event.x - 220
+            self.tooltip.place(x=tx, y=event.y - 110)
+            
+            # 십자선 효과를 위해 즉시 갱신
+            self.update_chart_view(highlight_idx=x_idx)
 
-def update_chart_canvas():
-    y = np.array(price_history)
-    x = np.arange(len(y))
-    ax.clear()
-    ax.set_facecolor('#071122')
-    ax.plot(x, y, linewidth=1.6, color='#FBBF24')
-    ax.fill_between(x, y, y.min(), alpha=0.06, color='#FBBF24')
-    ax.set_xticks([])
-    ax.tick_params(axis='y', colors='#cbd5e1')
-    ax.spines['bottom'].set_color('#334155')
-    ax.spines['left'].set_color('#334155')
-    cur_price_lbl.config(text=f"Current Price: {int(current_price)}")
-    canvas.draw()
+    def on_chart_leave(self, event):
+        self.tooltip.place_forget()
+        self.update_chart_view()
 
-# ------------------ 메인 루프: 카메라 + 제스처 + 시뮬레이션 ------------------
-# 제스처 사운드 타이밍을 여기서 관리 (원본 로직 유지)
-def main_loop():
-    global current_price, order_amount
-    global right_fist_start, left_fist_start
-    global last_inc_sound, last_dec_sound, last_reset_sound, last_trade_sound
-
-    now = time.time()
-    # 1) 카메라 읽기
-    ret, frame = cap.read()
-    if not ret:
-        root.after(20, main_loop)
-        return
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
-
-    current_time = time.time()
-    right_fist = False
-    left_fist = False
-    open_palm_seen = False
-
-    if results.multi_hand_landmarks:
-        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-            label = handedness.classification[0].label
-
-            if detect_fist(hand_landmarks):
-                if label == "Right":
-                    right_fist = True
-                    if right_fist_start is None:
-                        right_fist_start = current_time
-                elif label == "Left":
-                    left_fist = True
-                    if left_fist_start is None:
-                        left_fist_start = current_time
-
-            elif detect_open_palm(hand_landmarks):
-                open_palm_seen = True
-                # 손바닥 → 현재가로 리셋 (원본 로직)
-                if int(order_amount) != int(current_price):
-                    order_amount = int(current_price)
-                    order_entry.delete(0, 'end')
-                    order_entry.insert(0, str(int(order_amount)))
-
+    def execute_trade(self, side):
+        krw_rate = 1350
+        cost = int(self.order_amount * krw_rate)
+        if side == "BUY":
+            if self.balance >= cost:
+                self.balance -= cost
+                self.holdings += 1
+                self.show_toast(f"{self.order_amount}$ 매수 완료", COLOR_TOSS_RED)
             else:
-                # 검지/중지 기반 증감 (원본 로직)
-                gesture = detect_price_gesture(hand_landmarks)
-                if gesture == "INC":
-                    order_amount = int(order_amount) + STEP_NORMAL
-                    order_entry.delete(0, 'end'); order_entry.insert(0, str(int(order_amount)))
-                    if current_time - last_inc_sound >= SND_COOLDOWN_INC:
-                        _async(snd_inc); last_inc_sound = current_time
-                elif gesture == "DEC":
-                    order_amount = int(order_amount) - STEP_NORMAL
-                    order_entry.delete(0, 'end'); order_entry.insert(0, str(int(order_amount)))
-                    if current_time - last_dec_sound >= SND_COOLDOWN_DEC:
-                        _async(snd_dec); last_dec_sound = current_time
+                self.show_toast("잔액이 부족합니다", "#6B7684")
+        else:
+            if self.holdings > 0:
+                self.balance += cost
+                self.holdings -= 1
+                self.show_toast(f"{self.order_amount}$ 매도 완료", COLOR_TOSS_BLUE)
+            else:
+                self.show_toast("보유 주식이 없습니다", "#6B7684")
+        
+        self.lbl_balance.config(text=f"{self.balance:,}원")
+        self.lbl_holdings_info.config(text=f"{self.holdings}주 보유 중")
 
-            # 랜드마크 그리기
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+    def show_toast(self, msg, color):
+        self.toast.config(text=msg, bg=color)
+        self.toast.place(relx=0.5, rely=0.05, anchor='n')
+        self.root.after(2000, self.toast.place_forget)
 
-    # 주먹 4초 유지 -> 거래 체결 (원본 로직)
-    if right_fist and right_fist_start and (current_time - right_fist_start >= 4.0):
-        execute_trade("BUY", current_price)
-        right_fist_start = None
-    elif not right_fist:
-        right_fist_start = None
+    def main_loop(self):
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.hands.process(rgb_frame)
+            
+            if results.multi_hand_landmarks:
+                for hl, hn in zip(results.multi_hand_landmarks, results.multi_handedness):
+                    self.mp_drawing.draw_landmarks(frame, hl, self.mp_hands.HAND_CONNECTIONS)
+                    label = hn.classification[0].label 
+                    
+                    folded = sum(1 for t in [8, 12, 16, 20] if hl.landmark[t].y > hl.landmark[t-2].y)
+                    now = time.time()
+                    
+                    if folded >= 4:
+                        if label == "Right":
+                            if self.right_fist_start is None: self.right_fist_start = now
+                            if now - self.right_fist_start >= 1.5:
+                                self.execute_trade("BUY")
+                                self.right_fist_start = None
+                        else:
+                            if self.left_fist_start is None: self.left_fist_start = now
+                            if now - self.left_fist_start >= 1.5:
+                                self.execute_trade("SELL")
+                                self.left_fist_start = None
+                    else:
+                        self.right_fist_start = self.left_fist_start = None
+                        idx_y = hl.landmark[8].y 
+                        mid_y = hl.landmark[12].y 
+                        if idx_y < mid_y - 0.05: 
+                            self.order_amount += self.STEP
+                        elif mid_y < idx_y - 0.05: 
+                            self.order_amount -= self.STEP
+                        
+                        self.ent_order.delete(0, 'end')
+                        self.ent_order.insert(0, str(int(self.order_amount)))
 
-    if left_fist and left_fist_start and (current_time - left_fist_start >= 4.0):
-        execute_trade("SELL", current_price)
-        left_fist_start = None
-    elif not left_fist:
-        left_fist_start = None
+            img = Image.fromarray(rgb_frame)
+            imgtk = ImageTk.PhotoImage(image=img.resize((CAM_W, CAM_H)))
+            self.lbl_cam.imgtk = imgtk
+            self.lbl_cam.configure(image=imgtk)
+            
+        self.root.after(30, self.main_loop)
 
-    # 손바닥 리셋 사운드 (원본 로직)
-    if open_palm_seen and (current_time - last_reset_sound >= SND_COOLDOWN_RESET):
-        _async(snd_reset)
-        last_reset_sound = current_time
-
-    # 카메라를 Tkinter에 표시
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(img).resize((CAM_W, CAM_H))
-    imgtk = ImageTk.PhotoImage(image=img)
-    camera_label.imgtk = imgtk
-    camera_label.configure(image=imgtk)
-
-    # 손 상태 원형 표시(간단)
-    left_state_canvas.delete('all'); right_state_canvas.delete('all')
-    # 왼손/오른손 상태 채움: 주먹이면 채움(●), 아니면 빈원(○)
-    if left_fist:
-        left_state_canvas.create_oval(2,2,14,14, fill='#DC2626', outline='')
-    else:
-        left_state_canvas.create_oval(2,2,14,14, outline='#cbd5e1', width=1)
-    if right_fist:
-        right_state_canvas.create_oval(2,2,14,14, fill='#16A34A', outline='')
-    else:
-        right_state_canvas.create_oval(2,2,14,14, outline='#cbd5e1', width=1)
-
-    # 2) 가격 시뮬레이션 (GBM)
-    # 더 현실적인 움직임: 작은 drift + 저변동성 + 가끔 뉴스 충격(랜덤 점프)
-    jump = 0.0
-    if np.random.rand() < 0.004:  # 드문 큰 점프(뉴스)
-        jump = np.random.choice([-1,1]) * np.random.uniform(0.6, 2.5)
-    next_price = gbm_next_price(current_price) * (1.0 + jump/100.0)
-    current_price = max(1.0, next_price)
-    price_history.append(current_price)
-
-    # 때때로 내부적으로 order_level에 근접하면 로그(모의 체결 힌트)
-    # (실제 체결은 주먹 4초 혹은 버튼으로 실행)
-    if abs(current_price - float(order_entry.get() or 0)) < 2.5:
-        append_log(f"Price near order level: {int(current_price)}")
-
-    # 차트 업데이트는 부담을 줄이기 위해 5틱에 한 번
-    update_chart_canvas()
-
-    # 루프 재호출
-    root.after(int(1000 * TICK_DT), main_loop)
-
-# 시작
-root.after(100, main_loop)
-root.protocol("WM_DELETE_WINDOW", lambda: (cap.release(), root.destroy()))
-root.mainloop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TossGestureHTS(root)
+    root.mainloop()
