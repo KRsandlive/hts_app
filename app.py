@@ -13,6 +13,16 @@ import pandas as pd
 import numpy as np
 from contextlib import suppress
 import math
+import os
+import sys
+
+def resource_path(relative_path):
+    """ 실행 파일 내부의 임시 폴더 경로를 반환합니다. """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # ------------------ [설정] UI & 컬러 (Premium Toss Dark Theme) ------------------
 COLOR_BG = "#0F1419"        
@@ -59,7 +69,7 @@ class RoundedFrame(tk.Canvas):
         self.bg_color = bg_color
         self.corner_radius = corner_radius
         self.bind("<Configure>", self._on_resize)
-        
+
     def _on_resize(self, event=None):
         self.delete("bg")
         w, h = self.winfo_width(), self.winfo_height()
@@ -139,6 +149,8 @@ class ModernButton(tk.Canvas):
     def set_active(self, active):
         self.is_active = active
         self.draw()
+    
+    
 
 
 class ModernSlider(tk.Canvas):
@@ -168,7 +180,7 @@ class ModernSlider(tk.Canvas):
         h = 40
         track_y = h // 2
         track_height = 4
-        
+   
         # 트랙 배경 (둥근 모서리)
         r = track_height // 2
         self.create_oval(10, track_y-r, 10+track_height, track_y+r, fill=COLOR_DIVIDER, outline="")
@@ -265,6 +277,10 @@ class GestureProgressIndicator(tk.Canvas):
 class TossGestureHTS:
     def __init__(self, root):
         self.root = root
+        icon_file = resource_path('toss.ico')
+        if os.path.isfile(icon_file):
+            self.root.iconbitmap(icon_file)
+
         self.root.title("Toss Invest Pro")
         self.root.geometry("1500x950")
         self.root.configure(bg=COLOR_BG)

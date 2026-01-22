@@ -1,0 +1,6 @@
+pyinstaller --noconfirm --onefile --windowed ^
+--collect-all mediapipe ^
+--add-data "C:/Users/o365p/AppData/Local/Programs/Python/Python312/Lib/site-packages/mediapipe/modules;mediapipe/modules" ^
+--add-data "toss.ico;." ^
+--icon="toss.ico" ^
+app.py
