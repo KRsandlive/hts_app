@@ -200,13 +200,15 @@ pip install opencv-python mediapipe yfinance matplotlib pandas numpy pillow
 ```
 
 ```bash
-python main.py
+python3.12 app.py
 ```
 
 ---
 
 ## 참고 사항
 
+* 무조건 파이썬 3.12를 사용해야 합니다.
+  (mediapipe의 호환성문제 때문에)
 * 실제 증권사 API와 연동되지 않습니다.
 * 모든 거래는 UI 및 로직 검증을 위한 시뮬레이션입니다.
 * 제스처 기능 사용을 위해 웹캠이 필요합니다.
