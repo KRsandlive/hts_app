@@ -90,7 +90,7 @@ pip install opencv-python mediapipe yfinance matplotlib pandas numpy pillow
 Run the application:
 
 ```bash
-python main.py
+python app.py
 ```
 
 ---
