@@ -90,13 +90,14 @@ pip install opencv-python mediapipe yfinance matplotlib pandas numpy pillow
 Run the application:
 
 ```bash
-python app.py
+python3.12 app.py
 ```
 
 ---
 
 ## Notes
 
+* Must use Python3.12(beacause of mediapipe)
 * This project does **not** connect to real brokerage APIs.
 * All trading actions are simulated for UI and interaction testing.
 * Webcam access is required for gesture functionality.
