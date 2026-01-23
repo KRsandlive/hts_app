@@ -15,6 +15,11 @@ from contextlib import suppress
 import math
 import os
 import sys
+from io import BytesIO
+try:
+    import requests
+except ImportError:
+    requests = None
 
 def resource_path(relative_path):
     """ 실행 파일 내부의 임시 폴더 경로를 반환합니다. """
@@ -45,6 +50,11 @@ KRW_USD_RATE = 1350
 FIST_HOLD_DURATION = 1.5
 PRICE_STEP = 5
 
+# 화폐 설정
+CURRENCY_KRW = "KRW"
+CURRENCY_USD = "USD"
+CURRENCY_SYMBOLS = {"KRW": "₩", "USD": "$"}
+
 # 차트 설정
 DEFAULT_VIEW_WINDOW = 60
 MIN_VIEW_WINDOW = 5
@@ -60,6 +70,21 @@ MAX_NUM_HANDS = 2
 CAMERA_UPDATE_INTERVAL = 30
 TOAST_DURATION = 2000
 PRICE_UPDATE_INTERVAL = 10000  # 10초마다 가격 업데이트
+
+# 미증시 시가총액 상위 종목
+TOP_STOCKS = [
+    ("S&P 500", "^GSPC", "📈"),  # 지수
+    ("Apple", "AAPL", "🍎"),
+    ("Microsoft", "MSFT", "💻"),
+    ("Nvidia", "NVDA", "🎮"),
+    ("Amazon", "AMZN", "📦"),
+    ("Alphabet", "GOOGL", "🔍"),
+    ("Meta", "META", "👥"),
+    ("Tesla", "TSLA", "🚗"),
+    ("Berkshire", "BRK-B", "🏦"),
+    ("Broadcom", "AVGO", "💡"),
+    ("Walmart", "WMT", "🏪")
+]
 
 
 class RoundedFrame(tk.Canvas):
@@ -237,43 +262,6 @@ class ModernSlider(tk.Canvas):
         self.draw()
 
 
-class GestureProgressIndicator(tk.Canvas):
-    """제스처 진행도 표시기"""
-    def __init__(self, parent, title, color, **kwargs):
-        super().__init__(parent, width=140, height=140, bg=COLOR_CARD, 
-                        highlightthickness=0, **kwargs)
-        self.title = title
-        self.color = color
-        self.progress = 0.0
-        self.draw()
-    
-    def draw(self):
-        self.delete("all")
-        cx, cy = 70, 70
-        radius = 50
-        
-        # 배경 원
-        self.create_oval(cx-radius, cy-radius, cx+radius, cy+radius, 
-                        outline=COLOR_DIVIDER, width=6, fill="")
-        
-        # 진행도 호
-        if self.progress > 0:
-            extent = -360 * self.progress
-            self.create_arc(cx-radius, cy-radius, cx+radius, cy+radius,
-                          start=90, extent=extent, outline=self.color, 
-                          width=6, style='arc')
-        
-        # 텍스트
-        self.create_text(cx, cy-10, text=self.title, 
-                        font=("Malgun Gothic", 11, "bold"), fill=COLOR_TEXT_MAIN)
-        self.create_text(cx, cy+15, text=f"{int(self.progress*100)}%", 
-                        font=("Segoe UI", 16, "bold"), fill=self.color)
-    
-    def set_progress(self, progress):
-        self.progress = max(0, min(1, progress))
-        self.draw()
-
-
 class TossGestureHTS:
     def __init__(self, root):
         self.root = root
@@ -284,12 +272,36 @@ class TossGestureHTS:
         self.root.title("Toss Invest Pro")
         self.root.geometry("1500x950")
         self.root.configure(bg=COLOR_BG)
+        
+        # ttk 스크롤바 스타일 설정
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Toss.Vertical.TScrollbar',
+                       background=COLOR_CARD,
+                       troughcolor=COLOR_CARD,
+                       bordercolor=COLOR_CARD,
+                       darkcolor='#666666',
+                       lightcolor='#888888',
+                       arrowcolor='#AAAAAA',
+                       relief='flat',
+                       thumbcolor='#666666')
 
         # 데이터 및 상태 초기화
         self.balance = INITIAL_BALANCE
-        self.holdings = 0
+        self.holdings = {}  # 보유 주식: symbol -> quantity
         self.symbol = "^GSPC" 
         self.symbol_display = "S&P 500"
+        
+        # 화폐 설정
+        self.current_currency = CURRENCY_KRW  # 기본값: 원화
+        self.krw_usd_rate = 1350.0  # 기본 환율
+        self.stock_prices = {}  # 주식별 가격 캐시: symbol -> price
+        
+        # 종목 선택 메뉴 상태
+        self.stock_menu = None
+        self.stock_menu_visible = False
+        self.stock_logos = {}  # 로고 이미지 캐시
+        self.filtered_stocks = TOP_STOCKS  # 필터링된 종목 리스트
         
         self.current_interval = "1d" 
         self.fetch_period = "max"     
@@ -306,6 +318,8 @@ class TossGestureHTS:
         # 제스처 상태
         self.right_fist_start = None
         self.left_fist_start = None
+        self.last_open_hand_time = 0  # 펼친 손 제스처 중복 방지용
+        self.OPEN_HAND_COOLDOWN = 0.5  # 0.5초 쿨다운
         
         # 데이터 fetch 중복 방지
         self.is_fetching = False
@@ -370,11 +384,25 @@ class TossGestureHTS:
         card = RoundedFrame(self.side_panel, height=200, corner_radius=20)
         card.pack(fill='x', pady=(0, 16))
         
-        tk.Label(
-            card, text=self.symbol_display, 
+        # 종목명과 드롭다운 버튼 컨테이너
+        symbol_container = tk.Frame(card, bg=COLOR_CARD)
+        symbol_container.place(x=30, y=25)
+        
+        self.lbl_symbol = tk.Label(
+            symbol_container, text=self.symbol_display, 
             font=("Malgun Gothic", 18, "bold"), 
-            bg=COLOR_CARD, fg=COLOR_TEXT_MAIN
-        ).place(x=30, y=25)
+            bg=COLOR_CARD, fg=COLOR_TEXT_MAIN,
+            cursor="hand2"
+        )
+        self.lbl_symbol.pack(side='left')
+        self.lbl_symbol.bind("<Button-1>", lambda e: self._toggle_stock_menu(card, symbol_container))
+        
+        # 드롭다운 화살표 버튼
+        self.dropdown_btn = tk.Canvas(symbol_container, width=24, height=24, bg=COLOR_CARD, highlightthickness=0)
+        self.dropdown_btn.pack(side='left', padx=(8, 0))
+        self._draw_dropdown_arrow(self.dropdown_btn, False)
+        self.dropdown_btn.bind("<Button-1>", lambda e: self._toggle_stock_menu(card, symbol_container))
+        self.dropdown_btn.config(cursor="hand2")
         
         self.lbl_price = tk.Label(
             card, text="0.00", 
@@ -395,31 +423,660 @@ class TossGestureHTS:
             font=("Malgun Gothic", 10), 
             bg=COLOR_CARD, fg=COLOR_TEXT_SUB
         )
-
-    def _create_asset_card(self):
-        """자산 정보 카드 생성"""
-        card = RoundedFrame(self.side_panel, height=140, corner_radius=20)
-        card.pack(fill='x', pady=(0, 16))
+    
+    def _draw_dropdown_arrow(self, canvas, is_open):
+        """드롭다운 화살표 그리기"""
+        canvas.delete("all")
+        w, h = 24, 24
+        center_x, center_y = w // 2, h // 2
         
-        tk.Label(
-            card, text="내 투자 원금", 
-            font=("Malgun Gothic", 10), 
-            bg=COLOR_CARD, fg=COLOR_TEXT_SUB
-        ).place(x=30, y=20)
+        if is_open:
+            # 위쪽 화살표 (메뉴가 열려있을 때)
+            points = [
+                center_x, center_y - 3,
+                center_x - 4, center_y + 2,
+                center_x + 4, center_y + 2
+            ]
+        else:
+            # 아래쪽 화살표 (메뉴가 닫혀있을 때)
+            points = [
+                center_x, center_y + 3,
+                center_x - 4, center_y - 2,
+                center_x + 4, center_y - 2
+            ]
         
-        self.lbl_balance = tk.Label(
-            card, text=f"{self.balance:,}원", 
-            font=("Segoe UI", 20, "bold"), 
+        canvas.create_polygon(points, fill=COLOR_TEXT_SUB, outline="")
+    
+    def _toggle_stock_menu(self, parent_card, anchor_widget):
+        """종목 선택 메뉴 토글"""
+        if self.stock_menu_visible:
+            self._hide_stock_menu()
+        else:
+            self._show_stock_menu(parent_card, anchor_widget)
+    
+    def _show_stock_menu(self, parent_card, anchor_widget):
+        """종목 선택 메뉴 표시"""
+        if self.stock_menu_visible:
+            return
+        
+        # 독립적인 창 생성
+        self.stock_menu_window = tk.Toplevel(self.root)
+        self.stock_menu_window.title("주식 선택")
+        self.stock_menu_window.geometry("340x600")
+        self.stock_menu_window.configure(bg=COLOR_BG)
+        self.stock_menu_window.resizable(False, False)
+        self.stock_menu_window.transient(self.root)
+        self.stock_menu_window.grab_set()
+        self.stock_menu_window.iconbitmap(resource_path("toss.ico"))
+        
+        # 창 닫기 이벤트
+        self.stock_menu_window.protocol("WM_DELETE_WINDOW", self._hide_stock_menu)
+        
+        # 메뉴 프레임
+        menu_frame = RoundedFrame(self.stock_menu_window, bg_color=COLOR_CARD, corner_radius=16)
+        menu_frame.pack(fill='both', expand=True, padx=12, pady=12)
+        
+        # 상단 헤더 (제목 + 검색 버튼)
+        self.header_frame = tk.Frame(menu_frame, bg=COLOR_CARD)
+        self.header_frame.pack(fill='x', padx=20, pady=(16, 12))
+        
+        title_label = tk.Label(
+            self.header_frame, text="주식 선택",
+            font=("Malgun Gothic", 18, "bold"),
             bg=COLOR_CARD, fg=COLOR_TEXT_MAIN
         )
-        self.lbl_balance.place(x=30, y=45)
+        title_label.pack(side='left')
         
-        self.lbl_holdings_info = tk.Label(
-            card, text=f"0주 보유 중", 
-            font=("Malgun Gothic", 10), 
+        # 검색 버튼 (토스틱 디자인)
+        self.search_button = tk.Canvas(
+            self.header_frame, width=36, height=36, bg=COLOR_CARD, highlightthickness=0
+        )
+        self.search_button.pack(side='right')
+        self._draw_search_button(self.search_button, False)
+        self.search_button.bind("<Button-1>", lambda e: self._toggle_search())
+        
+        # 검색 필드 (기본 숨김)
+        self.search_frame = tk.Frame(menu_frame, bg=COLOR_CARD)
+        self.search_frame.pack_propagate(False)
+        
+        # 검색 입력 필드 배경
+        search_bg = tk.Frame(self.search_frame, bg="#2C353F", height=36)
+        search_bg.pack(fill='x', padx=20, pady=(0, 12))
+        search_bg.pack_propagate(False)
+        
+        self.search_entry = tk.Entry(
+            search_bg,
+            font=("Malgun Gothic", 11),
+            bg="#2C353F",
+            fg=COLOR_TEXT_MAIN,
+            insertbackground=COLOR_TOSS_BLUE,
+            bd=0,
+            relief='flat'
+        )
+        self.search_entry.pack(fill='both', expand=True, padx=14, pady=8)
+        
+        def on_search_change(e=None):
+            query = self.search_entry.get().lower()
+            if not query:
+                self.filtered_stocks = TOP_STOCKS
+            else:
+                self.filtered_stocks = [
+                    stock for stock in TOP_STOCKS
+                    if query in stock[0].lower() or query in stock[1].lower()
+                ]
+            self._update_stock_list()
+        
+        self.search_entry.bind("<KeyRelease>", on_search_change)
+        
+        # 스크롤 컨테이너
+        scroll_container = tk.Frame(menu_frame, bg=COLOR_CARD)
+        scroll_container.pack(fill='both', expand=True, padx=16, pady=(0, 12))
+        
+        # 캔버스 (배경색 명시)
+        menu_canvas = tk.Canvas(scroll_container, bg=COLOR_CARD, highlightthickness=0, 
+                                highlightbackground=COLOR_CARD)
+        menu_canvas.pack(side="left", fill="both", expand=True)
+        
+        # 스크롤바 (톤 스타일 적용)
+        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=menu_canvas.yview,
+                                 style='Toss.Vertical.TScrollbar')
+        scrollbar.pack(side="right", fill="y", padx=(4, 0))
+        
+        # 스크롤 가능한 프레임
+        scrollable_frame = tk.Frame(menu_canvas, bg=COLOR_CARD)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: menu_canvas.configure(scrollregion=menu_canvas.bbox("all"))
+        )
+        
+        menu_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        menu_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 마우스 휠 스크롤
+        def _on_mousewheel(event):
+            menu_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        menu_canvas.bind("<MouseWheel>", _on_mousewheel)
+        
+        # 종목 목록 생성
+        self.menu_canvas = menu_canvas
+        self.scrollable_frame = scrollable_frame
+        self.filtered_stocks = TOP_STOCKS
+        self._update_stock_list()
+        
+        self.stock_menu_visible = True
+    
+    def _draw_search_button(self, canvas, active):
+        """검색 버튼 그리기 (토스틱 스타일)"""
+        canvas.delete("all")
+        bg_color = COLOR_BUTTON_ACTIVE if active else COLOR_BUTTON_INACTIVE
+        
+        # 둥근 배경
+        canvas.create_oval(2, 2, 34, 34, fill=bg_color, outline="")
+        
+        # 🔍 텍스트
+        canvas.create_text(18, 18, text="🔍", font=("Segoe UI", 14), fill="white")
+    
+    def _toggle_search(self):
+        """검색 필드 토글"""
+        if self.search_frame.winfo_ismapped():
+            self.search_frame.pack_forget()
+            self._draw_search_button(self.search_button, False)
+            # 검색 초기화
+            self.filtered_stocks = TOP_STOCKS
+            self._update_stock_list()
+        else:
+            self.search_frame.pack(fill='x', after=self.header_frame, padx=0, pady=0)
+            self._draw_search_button(self.search_button, True)
+            self.search_entry.delete(0, 'end')
+            self.search_entry.focus()
+    
+    def _update_stock_list(self):
+        """종목 목록 업데이트"""
+        if not hasattr(self, 'scrollable_frame') or not self.scrollable_frame:
+            return
+        
+        # 기존 위젯 제거
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        for i, (name, symbol, logo_url) in enumerate(self.filtered_stocks):
+            item_frame = tk.Frame(self.scrollable_frame, bg=COLOR_CARD)
+            item_frame.pack(fill='x', padx=0, pady=8)
+            
+            # 호버 효과를 위한 바인딩
+            def on_enter(e, frame=item_frame):
+                frame.config(bg="#252D37")
+                for child in frame.winfo_children():
+                    try:
+                        if isinstance(child, tk.Frame):
+                            child.config(bg="#252D37")
+                            for subchild in child.winfo_children():
+                                if isinstance(subchild, tk.Label):
+                                    subchild.config(bg="#252D37")
+                    except:
+                        pass
+            
+            def on_leave(e, frame=item_frame):
+                frame.config(bg=COLOR_CARD)
+                for child in frame.winfo_children():
+                    try:
+                        if isinstance(child, tk.Frame):
+                            child.config(bg=COLOR_CARD)
+                            for subchild in child.winfo_children():
+                                if isinstance(subchild, tk.Label):
+                                    subchild.config(bg=COLOR_CARD)
+                    except:
+                        pass
+            
+            item_frame.bind("<Enter>", on_enter)
+            item_frame.bind("<Leave>", on_leave)
+            
+            # 로고 이미지 (왼쪽)
+            logo_frame = tk.Frame(item_frame, bg=COLOR_CARD, width=44, height=44)
+            logo_frame.pack(side='left', padx=(12, 12), pady=0)
+            logo_frame.pack_propagate(False)
+            
+            logo_label = tk.Label(logo_frame, bg=COLOR_CARD)
+            logo_label.pack(expand=True, fill='both')
+            
+            # 로고 표시 (이모지)
+            if logo_url:
+                logo_label.config(text=logo_url, font=("Segoe UI", 18), fg=COLOR_TEXT_SUB)
+            else:
+                logo_label.config(text="📈", font=("Segoe UI", 18), fg=COLOR_TEXT_SUB)
+            
+            # 텍스트 정보 (오른쪽)
+            text_frame = tk.Frame(item_frame, bg=COLOR_CARD)
+            text_frame.pack(side='left', fill='both', expand=True, padx=(0, 16))
+            
+            # 종목명
+            name_label = tk.Label(
+                text_frame, text=name,
+                font=("Malgun Gothic", 12, "bold"),
+                bg=COLOR_CARD, fg=COLOR_TEXT_MAIN,
+                anchor='w'
+            )
+            name_label.pack(fill='x', pady=(6, 2))
+            name_label.bind("<Enter>", lambda e, f=item_frame: on_enter(e, f))
+            name_label.bind("<Leave>", lambda e, f=item_frame: on_leave(e, f))
+            
+            # 심볼
+            symbol_label = tk.Label(
+                text_frame, text=symbol,
+                font=("Malgun Gothic", 10),
+                bg=COLOR_CARD, fg=COLOR_TEXT_SUB,
+                anchor='w'
+            )
+            symbol_label.pack(fill='x', pady=(0, 6))
+            symbol_label.bind("<Enter>", lambda e, f=item_frame: on_enter(e, f))
+            symbol_label.bind("<Leave>", lambda e, f=item_frame: on_leave(e, f))
+            
+            # 클릭 이벤트
+            def on_click(e, s=symbol, n=name):
+                self._switch_stock(s, n)
+                self._hide_stock_menu()
+            
+            item_frame.bind("<Button-1>", on_click)
+            logo_label.bind("<Button-1>", on_click)
+            name_label.bind("<Button-1>", on_click)
+            symbol_label.bind("<Button-1>", on_click)
+            item_frame.config(cursor="hand2")
+            logo_label.config(cursor="hand2")
+            name_label.config(cursor="hand2")
+            symbol_label.config(cursor="hand2")
+        
+        self.menu_canvas.update_idletasks()
+        self.menu_canvas.configure(scrollregion=self.menu_canvas.bbox("all"))
+    
+    def _load_logo(self, label, url, symbol):
+        """로고 이미지 로드"""
+        if symbol in self.stock_logos:
+            label.config(image=self.stock_logos[symbol])
+            return
+        
+        # 기본 이미지 설정
+        default_img = Image.new('RGB', (32, 32), color=COLOR_DIVIDER)
+        default_photo = ImageTk.PhotoImage(default_img.resize((32, 32)))
+        label.config(image=default_photo)
+        label.image = default_photo
+        
+        # 백그라운드에서 로고 로드
+        def load_logo_async():
+            try:
+                if requests is None:
+                    return
+                
+                response = requests.get(url, timeout=2)
+                if response.status_code == 200:
+                    img = Image.open(BytesIO(response.content))
+                    img = img.convert('RGBA')
+                    
+                    # 투명 배경 처리
+                    background = Image.new('RGBA', img.size, COLOR_CARD)
+                    img = Image.alpha_composite(background, img)
+                    
+                    img = img.resize((32, 32), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    
+                    self.stock_logos[symbol] = photo
+                    self.root.after(0, lambda: label.config(image=photo) or setattr(label, 'image', photo))
+            except Exception as e:
+                # 로고 로드 실패 시 기본 아이콘 사용
+                pass
+        
+        threading.Thread(target=load_logo_async, daemon=True).start()
+    
+    def _create_custom_scrollbar(self, parent, canvas):
+        """토스틱 커스텀 스크롤바 생성"""
+        # 더 이상 사용하지 않음
+        pass
+    
+    def _draw_currency_button(self, canvas):
+        """화폐 전환 버튼 그리기"""
+        canvas.delete("all")
+        w, h = 50, 32
+        
+        # 버튼 배경
+        canvas.create_rectangle(0, 0, w, h, fill=COLOR_DIVIDER, outline=COLOR_DIVIDER, width=0)
+        
+        # 현재 화폐 표시
+        currency_text = "KRW" if self.current_currency == CURRENCY_KRW else "USD"
+        canvas.create_text(w/2, h/2, text=currency_text, fill=COLOR_TOSS_BLUE, 
+                          font=("Malgun Gothic", 9, "bold"))
+    
+    def _toggle_currency(self, event=None):
+        """화폐 단위 전환"""
+        # 현재 화폐를 기준으로 변환 (상태 변경 전에 계산)
+        try:
+            # 쉼표 제거 후 파싱
+            current_value = float(self.ent_order.get().replace(',', ''))
+            
+            if self.current_currency == CURRENCY_KRW:
+                # 원 → 달러로 변환
+                new_value = current_value / self.krw_usd_rate
+            else:
+                # 달러 → 원으로 변환
+                new_value = current_value * self.krw_usd_rate
+            
+            self.ent_order.delete(0, 'end')
+            self.ent_order.insert(0, f"{new_value:,.2f}")
+        except (ValueError, AttributeError):
+            # 입력값이 없거나 숫자가 아니면 무시
+            pass
+        
+        # 그 다음에 화폐 상태 변경
+        if self.current_currency == CURRENCY_KRW:
+            self.current_currency = CURRENCY_USD
+        else:
+            self.current_currency = CURRENCY_KRW
+        
+        self._update_balance_display()
+        self._update_order_currency_label()
+        self._update_holdings_display()
+        self._update_price_display()  # 현재가도 업데이트
+        self._draw_currency_button(self.currency_btn)
+    
+    def _update_order_currency_label(self):
+        """주문 가격 화폐 레이블 업데이트"""
+        if self.current_currency == CURRENCY_KRW:
+            currency_text = "설정 주문가 (₩)"
+        else:
+            currency_text = "설정 주문가 ($)"
+        
+        if hasattr(self, 'lbl_order_currency'):
+            self.lbl_order_currency.config(text=currency_text)
+    
+    def _update_balance_display(self):
+        """잔액 표시 업데이트"""
+        if self.current_currency == CURRENCY_KRW:
+            display_balance = self.balance
+            currency_symbol = "₩"
+        else:
+            display_balance = self.balance / self.krw_usd_rate
+            currency_symbol = "$"
+        
+        if hasattr(self, 'lbl_balance'):
+            self.lbl_balance.config(text=f"{currency_symbol}{display_balance:,.0f}")
+    
+    def _fetch_exchange_rate(self):
+        """실시간 원/달러 환율 가져오기"""
+        try:
+            krw_data = yf.Ticker("KRW=X").history(period="1d")
+            if not krw_data.empty:
+                self.krw_usd_rate = krw_data['Close'].iloc[-1]
+                self._update_balance_display()
+        except Exception as e:
+            # 환율 가져오기 실패 시 기본값 유지
+            pass
+    
+    def _fetch_holdings_prices(self):
+        """보유 종목 주가 가져오기"""
+        if not self.holdings:
+            return
+        
+        try:
+            for symbol in self.holdings.keys():
+                if symbol == self.symbol:  # 현재 보고 있는 종목은 이미 업데이트됨
+                    continue
+                
+                try:
+                    ticker = yf.Ticker(symbol)
+                    data = ticker.history(period="1d", interval="1m")
+                    if not data.empty:
+                        price = float(data['Close'].iloc[-1])
+                        self.stock_prices[symbol] = price
+                except Exception:
+                    pass
+            
+            # UI 업데이트
+            self.root.after(0, self._update_holdings_display)
+        except Exception as e:
+            pass
+    
+    def _update_holdings_display(self):
+        """보유 종목 표시 업데이트"""
+        if not hasattr(self, 'holdings_frame'):
+            return
+        
+        # 기존 위젯 제거
+        for widget in self.holdings_frame.winfo_children():
+            widget.destroy()
+        
+        if not self.holdings:
+            lbl = tk.Label(
+                self.holdings_frame, text="보유 종목 없음", 
+                font=("Malgun Gothic", 9), 
+                bg=COLOR_CARD, fg=COLOR_TEXT_SUB
+            )
+            lbl.pack(fill='x', padx=5, pady=3)
+            return
+        
+        # 6개 초과일 때 스크롤바 표시
+        if len(self.holdings) > 6:
+            self.holdings_scrollbar.pack(side='right', fill='y', padx=(2, 0))
+        else:
+            self.holdings_scrollbar.pack_forget()
+        
+        # 보유 종목을 1줄씩 표시 (심볼 | 수량 | 평가가)
+        for symbol, quantity in self.holdings.items():
+            current_price = self.stock_prices.get(symbol, 0)
+            eval_price_krw = current_price * quantity * self.krw_usd_rate
+            
+            if self.current_currency == CURRENCY_KRW:
+                eval_display = f"₩{eval_price_krw:,.0f}"
+            else:
+                eval_display = f"${current_price * quantity:,.1f}"
+            
+            # 한 줄: [심볼 (수량주)] [평가가]
+            text = f"{symbol}({quantity:,.0f}주)  {eval_display}"
+            
+            lbl = tk.Label(
+                self.holdings_frame, text=text,
+                font=("Malgun Gothic", 8),
+                bg=COLOR_DIVIDER, fg=COLOR_TEXT_MAIN,
+                anchor='w', justify='left',
+                padx=4, pady=2
+            )
+            lbl.pack(fill='x', padx=2, pady=1)
+    
+    def _hide_stock_menu(self):
+        """종목 선택 메뉴 숨기기"""
+        if hasattr(self, 'stock_menu_window') and self.stock_menu_window:
+            self.stock_menu_window.destroy()
+            self.stock_menu_window = None
+        self.stock_menu_visible = False
+        self.filtered_stocks = TOP_STOCKS  # 필터 초기화
+        self._draw_dropdown_arrow(self.dropdown_btn, False)
+    
+    def _switch_stock(self, symbol, name):
+        """주식 전환"""
+        self.symbol = symbol
+        self.symbol_display = name
+        
+        # 가격 카드의 심볼 표시 업데이트
+        if hasattr(self, 'lbl_symbol'):
+            self.lbl_symbol.config(text=name)
+        
+        # 메뉴 닫기
+        self._hide_stock_menu()
+        
+        # 현재 주기 텍스트 찾기
+        current_text = "일봉"
+        for text, btn in self.unit_btns.items():
+            if btn.is_active:
+                current_text = text
+                break
+        
+        # 데이터 로드
+        self.change_unit(self.current_interval, current_text)
+
+    def _create_asset_card(self):
+        """자산 정보 카드 생성 (토스 스타일) - 좌우 분할 레이아웃"""
+        card = RoundedFrame(self.side_panel, height=130, corner_radius=20)
+        card.pack(fill='x', pady=(0, 16))
+        
+        # 좌측: 총 자산 섹션 (150px 너비)
+        tk.Label(
+            card, text="총 자산", 
+            font=("Malgun Gothic", 9), 
+            bg=COLOR_CARD, fg=COLOR_TEXT_SUB
+        ).place(x=20, y=15)
+        
+        self.lbl_balance = tk.Label(
+            card, text=f"₩50M", 
+            font=("Segoe UI", 18, "bold"), 
             bg=COLOR_CARD, fg=COLOR_TOSS_BLUE
         )
-        self.lbl_holdings_info.place(x=32, y=95)
+        self.lbl_balance.place(x=20, y=35)
+        
+        # 화폐 전환 버튼
+        self.currency_btn = tk.Canvas(
+            card, width=48, height=28, bg=COLOR_CARD, highlightthickness=0
+        )
+        self.currency_btn.place(x=20, y=90)
+        self._draw_currency_button(self.currency_btn)
+        self.currency_btn.bind("<Button-1>", self._toggle_currency)
+        self.currency_btn.config(cursor="hand2")
+        
+        # 중단: 구분선
+        tk.Frame(card, bg=COLOR_DIVIDER, width=1).place(x=185, y=15, width=1, height=100)
+        
+        # 우측: 보유 종목 섹션 (넓게 확장)
+        tk.Label(
+            card, text="보유 종목", 
+            font=("Malgun Gothic", 9, "bold"), 
+            bg=COLOR_CARD, fg=COLOR_TEXT_MAIN
+        ).place(x=205, y=15)
+        
+        # 보유 종목 표시 프레임 (커스텀 스크롤바 컨테이너)
+        holdings_container = tk.Frame(card, bg=COLOR_CARD)
+        holdings_container.place(x=205, y=35, width=195, height=80)
+        
+        # Canvas
+        self.holdings_canvas = tk.Canvas(
+            holdings_container, bg=COLOR_CARD, highlightthickness=0,
+            highlightbackground=COLOR_CARD, width=170, height=80
+        )
+        self.holdings_canvas.pack(side='left', fill='both', expand=True)
+        
+        # 커스텀 스크롤바 Canvas
+        self.holdings_scrollbar_canvas = tk.Canvas(
+            holdings_container, bg=COLOR_CARD, highlightthickness=0,
+            width=12, height=80
+        )
+        self.holdings_scrollbar_canvas.pack(side='right', fill='y')
+        
+        # 스크롤 상태
+        self.holdings_scroll_state = {'thumb_y': 0, 'thumb_height': 10, 'dragging': False}
+        
+        self.holdings_canvas.bind("<MouseWheel>", self._on_holdings_mousewheel)
+        self.holdings_scrollbar_canvas.bind("<Button-1>", self._on_scrollbar_click)
+        self.holdings_scrollbar_canvas.bind("<B1-Motion>", self._on_scrollbar_drag)
+        self.holdings_scrollbar_canvas.bind("<ButtonRelease-1>", self._on_scrollbar_release)
+        
+        # 내부 프레임
+        self.holdings_frame = tk.Frame(self.holdings_canvas, bg=COLOR_CARD)
+        self.holdings_canvas.create_window((0, 0), window=self.holdings_frame, anchor='nw')
+        
+        self.holdings_frame.bind(
+            "<Configure>",
+            lambda e: self._update_holdings_scrollbar_display()
+        )
+    
+    def _update_holdings_scrollbar_display(self):
+        """보유 종목 스크롤바 표시 업데이트"""
+        self.holdings_canvas.configure(scrollregion=self.holdings_canvas.bbox("all"))
+        
+        # Canvas 크기와 content 크기로 스크롤 필요 여부 판단
+        canvas_height = self.holdings_canvas.winfo_height()
+        content_height = self.holdings_canvas.bbox("all")[3] if self.holdings_canvas.bbox("all") else 0
+        
+        if canvas_height > 1 and content_height > canvas_height:
+            # 스크롤 필요 - 스크롤바 표시
+            self.holdings_scroll_state['thumb_height'] = max(10, (canvas_height / content_height) * (canvas_height - 4))
+            self._draw_holdings_scrollbar()
+        else:
+            # 스크롤 불필요 - 스크롤바 숨김
+            self.holdings_scrollbar_canvas.delete("all")
+    
+    def _draw_holdings_scrollbar(self):
+        """보유 종목 스크롤바 그리기"""
+        self.holdings_scrollbar_canvas.delete("all")
+        canvas_height = self.holdings_canvas.winfo_height()
+        thumb_y = self.holdings_scroll_state['thumb_y']
+        thumb_height = self.holdings_scroll_state['thumb_height']
+        
+        # 스크롤바 트랙
+        self.holdings_scrollbar_canvas.create_rectangle(2, 2, 10, canvas_height-2, 
+                                                       fill='#2A2A2E', outline='')
+        
+        # 스크롤바 Thumb (밝은 회색)
+        self.holdings_scrollbar_canvas.create_rectangle(2, thumb_y+2, 10, thumb_y+thumb_height, 
+                                                       fill='#999999', outline='#CCCCCC', width=0)
+    
+    def _on_holdings_mousewheel(self, event):
+        """보유 종목 마우스 휠 스크롤"""
+        canvas_height = self.holdings_canvas.winfo_height()
+        content_height = self.holdings_canvas.bbox("all")[3] if self.holdings_canvas.bbox("all") else 0
+        
+        if content_height <= canvas_height:
+            return
+        
+        scroll_amount = 15  # 한 번에 스크롤할 픽셀 수
+        if event.delta > 0:
+            self.holdings_canvas.yview_scroll(-1, "units")
+        else:
+            self.holdings_canvas.yview_scroll(1, "units")
+        
+        # 스크롤 상태 업데이트
+        self._update_holdings_scroll_position()
+    
+    def _update_holdings_scroll_position(self):
+        """보유 종목 스크롤 위치 업데이트"""
+        canvas_height = self.holdings_canvas.winfo_height()
+        content_height = self.holdings_canvas.bbox("all")[3] if self.holdings_canvas.bbox("all") else 0
+        
+        if content_height <= canvas_height:
+            self.holdings_scroll_state['thumb_y'] = 0
+        else:
+            # Canvas의 현재 스크롤 위치를 가져오기
+            scroll_y = self.holdings_canvas.yview()[0]  # 0~1 사이의 값
+            thumb_y = scroll_y * (canvas_height - self.holdings_scroll_state['thumb_height'])
+            self.holdings_scroll_state['thumb_y'] = max(0, min(thumb_y, canvas_height - self.holdings_scroll_state['thumb_height']))
+        
+        self._draw_holdings_scrollbar()
+    
+    def _on_scrollbar_click(self, event):
+        """스크롤바 클릭"""
+        self.holdings_scroll_state['dragging'] = True
+        self._handle_scrollbar_interaction(event)
+    
+    def _on_scrollbar_drag(self, event):
+        """스크롤바 드래그"""
+        if self.holdings_scroll_state['dragging']:
+            self._handle_scrollbar_interaction(event)
+    
+    def _on_scrollbar_release(self, event):
+        """스크롤바 드래그 종료"""
+        self.holdings_scroll_state['dragging'] = False
+    
+    def _handle_scrollbar_interaction(self, event):
+        """스크롤바 상호작용 처리"""
+        canvas_height = self.holdings_canvas.winfo_height()
+        content_height = self.holdings_canvas.bbox("all")[3] if self.holdings_canvas.bbox("all") else 0
+        
+        if content_height <= canvas_height:
+            return
+        
+        # 클릭/드래그 위치에서 스크롤 계산
+        thumb_height = self.holdings_scroll_state['thumb_height']
+        max_thumb_y = canvas_height - thumb_height
+        
+        thumb_y = max(0, min(event.y - thumb_height/2, max_thumb_y))
+        scroll_position = thumb_y / max_thumb_y if max_thumb_y > 0 else 0
+        
+        self.holdings_canvas.yview_moveto(scroll_position)
+        self._update_holdings_scroll_position()
 
     def _create_vision_card(self):
         """비전 카메라 카드 생성"""
@@ -431,14 +1088,15 @@ class TossGestureHTS:
 
     def _create_order_panel(self):
         """주문 패널 + 제스처 진행도 생성"""
-        card = RoundedFrame(self.side_panel, height=390, corner_radius=20)
+        card = RoundedFrame(self.side_panel, height=220, corner_radius=20)
         card.pack(fill='x')
         
-        tk.Label(
+        self.lbl_order_currency = tk.Label(
             card, text="설정 주문가 ($)", 
             font=("Malgun Gothic", 10, "bold"), 
             bg=COLOR_CARD, fg=COLOR_TEXT_SUB
-        ).place(relx=0.5, y=30, anchor='center')
+        )
+        self.lbl_order_currency.place(relx=0.5, y=30, anchor='center')
         
         self.ent_order = tk.Entry(
             card, font=("Segoe UI", 28, "bold"), 
@@ -448,36 +1106,32 @@ class TossGestureHTS:
         )
         self.ent_order.place(relx=0.5, y=75, anchor='center')
         
-        # 매수/매도 버튼
-        buy_btn_canvas = tk.Canvas(card, width=175, height=55, bg=COLOR_CARD, highlightthickness=0)
-        buy_btn_canvas.place(x=25, y=130)
-        self._draw_trade_button(buy_btn_canvas, "살래요", COLOR_TOSS_RED, lambda: self.execute_trade("BUY"))
+        # 매수/매도 버튼 (제스처 진행도 표시 포함)
+        self.buy_btn_canvas = tk.Canvas(card, width=175, height=55, bg=COLOR_CARD, highlightthickness=0)
+        self.buy_btn_canvas.place(x=25, y=130)
+        self._draw_trade_button(self.buy_btn_canvas, "살래요", COLOR_TOSS_RED, lambda: self.execute_trade("BUY"), 0.0)
         
-        sell_btn_canvas = tk.Canvas(card, width=175, height=55, bg=COLOR_CARD, highlightthickness=0)
-        sell_btn_canvas.place(x=220, y=130)
-        self._draw_trade_button(sell_btn_canvas, "팔래요", COLOR_TOSS_BLUE, lambda: self.execute_trade("SELL"))
-        
-        # 제스처 진행도 표시기
-        tk.Label(
-            card, text="제스처 진행도", 
-            font=("Malgun Gothic", 11, "bold"), 
-            bg=COLOR_CARD, fg=COLOR_TEXT_MAIN
-        ).place(relx=0.5, y=210, anchor='center')
-        
-        gesture_container = tk.Frame(card, bg=COLOR_CARD)
-        gesture_container.place(relx=0.5, y=300, anchor='center')
-        
-        self.right_progress = GestureProgressIndicator(gesture_container, "매수", COLOR_TOSS_RED)
-        self.right_progress.pack(side='left', padx=10)
-        
-        self.left_progress = GestureProgressIndicator(gesture_container, "매도", COLOR_TOSS_BLUE)
-        self.left_progress.pack(side='left', padx=10)
+        self.sell_btn_canvas = tk.Canvas(card, width=175, height=55, bg=COLOR_CARD, highlightthickness=0)
+        self.sell_btn_canvas.place(x=220, y=130)
+        self._draw_trade_button(self.sell_btn_canvas, "팔래요", COLOR_TOSS_BLUE, lambda: self.execute_trade("SELL"), 0.0)
 
-    def _draw_trade_button(self, canvas, text, color, command):
-        """거래 버튼 그리기"""
+    def _update_button_progress(self, side, progress):
+        """버튼 진행도 업데이트"""
+        if side == "BUY":
+            self._draw_trade_button(self.buy_btn_canvas, "살래요", COLOR_TOSS_RED, 
+                                   lambda: self.execute_trade("BUY"), progress)
+        elif side == "SELL":
+            self._draw_trade_button(self.sell_btn_canvas, "팔래요", COLOR_TOSS_BLUE, 
+                                   lambda: self.execute_trade("SELL"), progress)
+    
+    def _draw_trade_button(self, canvas, text, color, command, progress=0.0):
+        """거래 버튼 그리기 (진행도 표시 포함)"""
+        canvas.delete("all")
         w, h = 175, 55
         radius = 14
+        border_width = 4
         
+        # 버튼 배경
         canvas.create_oval(0, 0, radius*2, radius*2, fill=color, outline=color)
         canvas.create_oval(w-radius*2, 0, w, radius*2, fill=color, outline=color)
         canvas.create_oval(0, h-radius*2, radius*2, h, fill=color, outline=color)
@@ -485,6 +1139,109 @@ class TossGestureHTS:
         canvas.create_rectangle(radius, 0, w-radius, h, fill=color, outline=color)
         canvas.create_rectangle(0, radius, w, h-radius, fill=color, outline=color)
         
+        # 진행도 테두리 (둥근 사각형 테두리)
+        if progress > 0:
+            progress_color = "white" if progress < 1.0 else "#FFD700"  # 완료 시 금색
+            border_progress = min(1.0, progress)
+            border_offset = border_width // 2
+            
+            # 전체 둘레 계산
+            # 위쪽: w - 2*radius, 오른쪽: h - 2*radius, 아래쪽: w - 2*radius, 왼쪽: h - 2*radius
+            # 모서리: 4 * (π * radius / 2) = 2 * π * radius
+            total_perimeter = 2 * (w + h - 2 * radius) + 2 * math.pi * radius
+            
+            # 진행된 길이
+            progress_length = total_perimeter * border_progress
+            current_length = 0
+            
+            # 위쪽 가로선 (왼쪽 → 오른쪽)
+            segment_length = w - 2 * radius
+            if current_length < progress_length:
+                line_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if line_progress > 0:
+                    end_x = radius + border_offset + segment_length * line_progress
+                    canvas.create_line(radius + border_offset, border_offset, 
+                                     end_x, border_offset,
+                                     fill=progress_color, width=border_width, capstyle=tk.ROUND)
+                current_length += segment_length
+            
+            # 오른쪽 위 모서리
+            segment_length = math.pi * radius / 2
+            if current_length < progress_length:
+                arc_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if arc_progress > 0:
+                    canvas.create_arc(w - radius*2 - border_offset, border_offset, 
+                                   w - border_offset, radius*2 + border_offset,
+                                   start=90, extent=-90 * arc_progress,
+                                   outline=progress_color, width=border_width, style='arc')
+                current_length += segment_length
+            
+            # 오른쪽 세로선 (위 → 아래)
+            segment_length = h - 2 * radius
+            if current_length < progress_length:
+                line_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if line_progress > 0:
+                    end_y = radius + border_offset + segment_length * line_progress
+                    canvas.create_line(w - border_offset, radius + border_offset,
+                                     w - border_offset, end_y,
+                                     fill=progress_color, width=border_width, capstyle=tk.ROUND)
+                current_length += segment_length
+            
+            # 오른쪽 아래 모서리
+            segment_length = math.pi * radius / 2
+            if current_length < progress_length:
+                arc_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if arc_progress > 0:
+                    canvas.create_arc(w - radius*2 - border_offset, h - radius*2 - border_offset,
+                                   w - border_offset, h - border_offset,
+                                   start=0, extent=-90 * arc_progress,
+                                   outline=progress_color, width=border_width, style='arc')
+                current_length += segment_length
+            
+            # 아래쪽 가로선 (오른쪽 → 왼쪽)
+            segment_length = w - 2 * radius
+            if current_length < progress_length:
+                line_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if line_progress > 0:
+                    end_x = w - radius - border_offset - segment_length * line_progress
+                    canvas.create_line(w - radius - border_offset, h - border_offset,
+                                     end_x, h - border_offset,
+                                     fill=progress_color, width=border_width, capstyle=tk.ROUND)
+                current_length += segment_length
+            
+            # 왼쪽 아래 모서리
+            segment_length = math.pi * radius / 2
+            if current_length < progress_length:
+                arc_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if arc_progress > 0:
+                    canvas.create_arc(border_offset, h - radius*2 - border_offset,
+                                   radius*2 + border_offset, h - border_offset,
+                                   start=270, extent=-90 * arc_progress,
+                                   outline=progress_color, width=border_width, style='arc')
+                current_length += segment_length
+            
+            # 왼쪽 세로선 (아래 → 위)
+            segment_length = h - 2 * radius
+            if current_length < progress_length:
+                line_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if line_progress > 0:
+                    end_y = h - radius - border_offset - segment_length * line_progress
+                    canvas.create_line(border_offset, h - radius - border_offset,
+                                     border_offset, end_y,
+                                     fill=progress_color, width=border_width, capstyle=tk.ROUND)
+                current_length += segment_length
+            
+            # 왼쪽 위 모서리
+            segment_length = math.pi * radius / 2
+            if current_length < progress_length:
+                arc_progress = min(1.0, (progress_length - current_length) / segment_length)
+                if arc_progress > 0:
+                    canvas.create_arc(border_offset, border_offset,
+                                   radius*2 + border_offset, radius*2 + border_offset,
+                                   start=180, extent=-90 * arc_progress,
+                                   outline=progress_color, width=border_width, style='arc')
+        
+        # 버튼 텍스트
         canvas.create_text(w/2, h/2, text=text, fill="white", 
                           font=("Malgun Gothic", 14, "bold"))
         
@@ -523,66 +1280,70 @@ class TossGestureHTS:
 
     def _create_tooltip(self):
         """차트 툴팁 생성 (HTS 스타일)"""
-        self.tooltip = tk.Canvas(self.chart_widget, width=200, height=180, 
-                                bg=COLOR_TOOLTIP_BG, highlightthickness=1, 
-                                highlightbackground="#404040")
+        self.tooltip = tk.Canvas(self.chart_widget, width=220, height=220, 
+                                bg=COLOR_TOOLTIP_BG, highlightthickness=0)
         
         # 둥근 모서리
         self.tooltip.bind("<Configure>", self._draw_tooltip_bg)
         
-        # 날짜/시간
+        # 헤더 (날짜/시간)
+        header_frame = tk.Frame(self.tooltip, bg="#2A2A2E", height=32)
+        header_frame.place(x=0, y=0, relwidth=1)
+        header_frame.pack_propagate(False)
+        
         self.lbl_tt_date = tk.Label(
-            self.tooltip, text="", 
-            font=("Malgun Gothic", 9), 
-            bg=COLOR_TOOLTIP_BG, fg="#888888",
+            header_frame, text="", 
+            font=("Malgun Gothic", 9, "bold"), 
+            bg="#2A2A2E", fg="#FFFFFF",
             anchor='w'
         )
-        self.lbl_tt_date.place(x=16, y=14)
+        self.lbl_tt_date.pack(side='left', padx=14, pady=8)
         
-        # 가격 정보
-        y_pos = 45
-        spacing = 25
+        # 가격 정보 (더 넓은 레이아웃)
+        y_pos = 48
+        spacing = 26  # 간격 약간 줄임
         
-        tk.Label(self.tooltip, text="시가", font=("Malgun Gothic", 8), 
-                bg=COLOR_TOOLTIP_BG, fg="#666666").place(x=16, y=y_pos)
+        tk.Label(self.tooltip, text="시가", font=("Malgun Gothic", 9), 
+                bg=COLOR_TOOLTIP_BG, fg="#999999").place(x=18, y=y_pos)
         self.lbl_tt_open = tk.Label(self.tooltip, text="", font=("Segoe UI", 10, "bold"), 
                                     bg=COLOR_TOOLTIP_BG, fg=COLOR_TEXT_MAIN)
-        self.lbl_tt_open.place(x=130, y=y_pos, anchor='e')
+        self.lbl_tt_open.place(x=200, y=y_pos, anchor='e')
         
         y_pos += spacing
-        tk.Label(self.tooltip, text="고가", font=("Malgun Gothic", 8), 
-                bg=COLOR_TOOLTIP_BG, fg="#666666").place(x=16, y=y_pos)
+        tk.Label(self.tooltip, text="고가", font=("Malgun Gothic", 9), 
+                bg=COLOR_TOOLTIP_BG, fg="#999999").place(x=18, y=y_pos)
         self.lbl_tt_high = tk.Label(self.tooltip, text="", font=("Segoe UI", 10, "bold"), 
                                     bg=COLOR_TOOLTIP_BG, fg=COLOR_TOSS_RED)
-        self.lbl_tt_high.place(x=130, y=y_pos, anchor='e')
+        self.lbl_tt_high.place(x=200, y=y_pos, anchor='e')
         
         y_pos += spacing
-        tk.Label(self.tooltip, text="저가", font=("Malgun Gothic", 8), 
-                bg=COLOR_TOOLTIP_BG, fg="#666666").place(x=16, y=y_pos)
+        tk.Label(self.tooltip, text="저가", font=("Malgun Gothic", 9), 
+                bg=COLOR_TOOLTIP_BG, fg="#999999").place(x=18, y=y_pos)
         self.lbl_tt_low = tk.Label(self.tooltip, text="", font=("Segoe UI", 10, "bold"), 
                                    bg=COLOR_TOOLTIP_BG, fg=COLOR_TOSS_BLUE)
-        self.lbl_tt_low.place(x=130, y=y_pos, anchor='e')
+        self.lbl_tt_low.place(x=200, y=y_pos, anchor='e')
         
         y_pos += spacing
-        tk.Label(self.tooltip, text="종가", font=("Malgun Gothic", 8), 
-                bg=COLOR_TOOLTIP_BG, fg="#666666").place(x=16, y=y_pos)
+        tk.Label(self.tooltip, text="종가", font=("Malgun Gothic", 9), 
+                bg=COLOR_TOOLTIP_BG, fg="#999999").place(x=18, y=y_pos)
         self.lbl_tt_close = tk.Label(self.tooltip, text="", font=("Segoe UI", 10, "bold"), 
                                      bg=COLOR_TOOLTIP_BG, fg=COLOR_TEXT_MAIN)
-        self.lbl_tt_close.place(x=130, y=y_pos, anchor='e')
+        self.lbl_tt_close.place(x=200, y=y_pos, anchor='e')
         
         y_pos += spacing
-        tk.Label(self.tooltip, text="거래량", font=("Malgun Gothic", 8), 
-                bg=COLOR_TOOLTIP_BG, fg="#666666").place(x=16, y=y_pos)
+        tk.Label(self.tooltip, text="거래량", font=("Malgun Gothic", 9), 
+                bg=COLOR_TOOLTIP_BG, fg="#999999").place(x=18, y=y_pos)
         self.lbl_tt_volume = tk.Label(self.tooltip, text="", font=("Segoe UI", 9), 
-                                      bg=COLOR_TOOLTIP_BG, fg="#AAAAAA")
-        self.lbl_tt_volume.place(x=130, y=y_pos, anchor='e')
+                                      bg=COLOR_TOOLTIP_BG, fg="#AAAAAA", anchor='e')
+        self.lbl_tt_volume.place(x=200, y=y_pos, anchor='e')
 
     def _draw_tooltip_bg(self, event=None):
         """툴팁 배경 그리기"""
-        w, h = 200, 180
-        r = 12
+        w, h = 220, 220
+        r = 14
         
         self.tooltip.delete("ttbg")
+        # 메인 배경
         self.tooltip.create_oval(0, 0, r*2, r*2, fill=COLOR_TOOLTIP_BG, outline="", tags="ttbg")
         self.tooltip.create_oval(w-r*2, 0, w, r*2, fill=COLOR_TOOLTIP_BG, outline="", tags="ttbg")
         self.tooltip.create_oval(0, h-r*2, r*2, h, fill=COLOR_TOOLTIP_BG, outline="", tags="ttbg")
@@ -710,6 +1471,13 @@ class TossGestureHTS:
         if not self.is_fetching and not self.df.empty:
             threading.Thread(target=self._fetch_current_price, daemon=True).start()
         
+        # 환율 업데이트 (10초마다)
+        threading.Thread(target=self._fetch_exchange_rate, daemon=True).start()
+        
+        # 보유 종목 주가 업데이트 (30초마다)
+        if len(self.holdings) > 0:
+            threading.Thread(target=self._fetch_holdings_prices, daemon=True).start()
+        
         self.root.after(PRICE_UPDATE_INTERVAL, self.update_current_price)
     
     def _fetch_current_price(self):
@@ -731,13 +1499,21 @@ class TossGestureHTS:
             print(f"Price update error: {e}")
     
     def _update_price_display(self):
-        """가격 표시 업데이트"""
+        """가격 표시 업데이트 (화폐 기준으로 변환)"""
         diff = self.current_price - self.prev_close
         diff_pct = (diff / self.prev_close * 100) if self.prev_close != 0 else 0
         color = COLOR_TOSS_RED if diff >= 0 else COLOR_TOSS_BLUE
         
-        self.lbl_price.config(text=f"{self.current_price:,.2f}", fg=color)
-        self.lbl_change.config(text=f"{diff:+,.2f} ({diff_pct:+.2f}%)", fg=color)
+        # 화폐 기준으로 표시
+        if self.current_currency == CURRENCY_KRW:
+            price_display = f"₩{self.current_price * self.krw_usd_rate:,.0f}"
+            diff_display = f"{diff * self.krw_usd_rate:+,.0f}"
+        else:
+            price_display = f"${self.current_price:,.2f}"
+            diff_display = f"{diff:+,.2f}"
+        
+        self.lbl_price.config(text=price_display, fg=color)
+        self.lbl_change.config(text=f"{diff_display} ({diff_pct:+.2f}%)", fg=color)
 
     def fetch_market_data(self):
         """시장 데이터 가져오기"""
@@ -774,6 +1550,9 @@ class TossGestureHTS:
             self.df = data
             self.current_price = float(data['Close'].iloc[-1])
             self.prev_close = float(data['Close'].iloc[-2]) if len(data) > 1 else self.current_price
+            
+            # 현재 심볼의 주가 캐시에 저장
+            self.stock_prices[self.symbol] = self.current_price
             
             if self.order_amount == 0:
                 self.order_amount = int(self.current_price)
@@ -886,6 +1665,20 @@ class TossGestureHTS:
         
         self._format_xaxis(x_indices, x_dates)
         
+        # 최고가 최저가 표시 (토스틱 스타일)
+        high_max = visible_df['High'].max()
+        low_min = visible_df['Low'].min()
+        self.ax.axhline(y=high_max, color=COLOR_TOSS_RED, linestyle='--', alpha=0.6, linewidth=1)
+        self.ax.axhline(y=low_min, color=COLOR_TOSS_BLUE, linestyle='--', alpha=0.6, linewidth=1)
+        
+        # 최고가 최저가 텍스트 표시
+        self.ax.text(len(visible_df) - 1, high_max, f'HIGH {high_max:.2f}', 
+                    color=COLOR_TOSS_RED, fontsize=8, ha='right', va='bottom', 
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor=COLOR_CARD, edgecolor=COLOR_TOSS_RED, alpha=0.8))
+        self.ax.text(len(visible_df) - 1, low_min, f'LOW {low_min:.2f}', 
+                    color=COLOR_TOSS_BLUE, fontsize=8, ha='right', va='top', 
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor=COLOR_CARD, edgecolor=COLOR_TOSS_BLUE, alpha=0.8))
+        
         if highlight_idx is not None and 0 <= highlight_idx < len(visible_df):
             self.ax.axvline(x=highlight_idx, color=COLOR_TEXT_SUB, alpha=0.3, 
                           linestyle='--', linewidth=1)
@@ -923,9 +1716,10 @@ class TossGestureHTS:
         tick_count = min(len(x_indices), 5)
         tick_pos = np.linspace(0, len(x_indices) - 1, tick_count, dtype=int)
         
-        if self.current_interval == "1y":
+        # 기간에 따라 날짜 포맷 동적 설정
+        if self.view_window >= 365:  # 1년 이상 표시 시 년도 표시
             date_format = '%Y'
-        elif self.current_interval == "1mo":
+        elif self.view_window >= 30:  # 1개월 이상 표시 시 년-월 표시
             date_format = '%Y-%m'
         elif "m" in self.current_interval:
             date_format = '%H:%M'
@@ -983,12 +1777,40 @@ class TossGestureHTS:
             self.lbl_tt_high.config(text=f"{row['High']:,.2f}")
             self.lbl_tt_low.config(text=f"{row['Low']:,.2f}")
             self.lbl_tt_close.config(text=f"{row['Close']:,.2f}")
-            self.lbl_tt_volume.config(text=f"{int(row['Volume']):,}")
-
-            # 툴팁 위치
+            
+            # 거래량 포맷팅 (천/백만/십억 단위)
+            volume = int(row['Volume'])
+            if volume >= 1_000_000_000:
+                volume_str = f"{volume / 1_000_000_000:.2f}B"
+            elif volume >= 1_000_000:
+                volume_str = f"{volume / 1_000_000:.2f}M"
+            elif volume >= 1_000:
+                volume_str = f"{volume / 1_000:.2f}K"
+            else:
+                volume_str = f"{volume:,}"
+            self.lbl_tt_volume.config(text=volume_str)
+            
+            # 툴팁 위치 (창 끝에서 사라지지 않도록 조정)
+            tooltip_width = 220
+            tooltip_height = 220
+            canvas_width = self.chart_widget.winfo_width()
+            canvas_height = self.chart_widget.winfo_height()
+            
             px = event.x + 15
             py = event.y + 15
-
+            
+            # 오른쪽 경계 체크
+            if px + tooltip_width > canvas_width:
+                px = event.x - tooltip_width - 15
+            
+            # 아래쪽 경계 체크
+            if py + tooltip_height > canvas_height:
+                py = event.y - tooltip_height - 15
+            
+            # 왼쪽/위쪽 경계 체크
+            px = max(0, px)
+            py = max(0, py)
+            
             self.tooltip.place(x=px, y=py)
             self.update_chart_view(highlight_idx=x_idx)
 
@@ -1008,31 +1830,41 @@ class TossGestureHTS:
     def execute_trade(self, side):
         """거래 실행"""
         try:
-            order_price = int(self.ent_order.get())
+            order_price = float(self.ent_order.get())
         except ValueError:
             self.show_toast("올바른 가격을 입력하세요", "#6B7684")
             return
         
-        cost = int(order_price * KRW_USD_RATE)
+        # 현재 화폐 설정에 따라 원화로 변환
+        if self.current_currency == CURRENCY_KRW:
+            cost = int(order_price)
+        else:
+            cost = int(order_price * self.krw_usd_rate)
         
         if side == "BUY":
             if self.balance >= cost:
                 self.balance -= cost
-                self.holdings += 1
-                self.show_toast(f"{order_price}$ 매수 완료", COLOR_TOSS_RED)
+                self.holdings[self.symbol] = self.holdings.get(self.symbol, 0) + 1
+                # 현재 가격 캐시에 저장
+                self.stock_prices[self.symbol] = order_price
+                display_price = f"{order_price:,.2f}"
+                self.show_toast(f"{display_price} 매수 완료", COLOR_TOSS_RED)
             else:
                 self.show_toast("잔액이 부족합니다", "#6B7684")
                 
         elif side == "SELL":
-            if self.holdings > 0:
+            if self.holdings.get(self.symbol, 0) > 0:
                 self.balance += cost
-                self.holdings -= 1
-                self.show_toast(f"{order_price}$ 매도 완료", COLOR_TOSS_BLUE)
+                self.holdings[self.symbol] -= 1
+                if self.holdings[self.symbol] == 0:
+                    del self.holdings[self.symbol]
+                display_price = f"{order_price:,.2f}"
+                self.show_toast(f"{display_price} 매도 완료", COLOR_TOSS_BLUE)
             else:
                 self.show_toast("보유 주식이 없습니다", "#6B7684")
         
-        self.lbl_balance.config(text=f"{self.balance:,}원")
-        self.lbl_holdings_info.config(text=f"{self.holdings}주 보유 중")
+        self._update_balance_display()
+        self._update_holdings_display()
 
     def show_toast(self, msg, color):
         """토스트 메시지 표시"""
@@ -1054,6 +1886,36 @@ class TossGestureHTS:
         
         return folded_count >= 4
 
+    def _is_hand_open(self, hand_landmarks):
+        """손이 완전히 펼쳐져 있는지 판단"""
+        open_count = 0
+        finger_tips = [8, 12, 16, 20]  # 검지, 중지, 약지, 소지 끝
+        
+        for tip_idx in finger_tips:
+            tip = hand_landmarks.landmark[tip_idx]
+            pip = hand_landmarks.landmark[tip_idx - 2]  # 각 손가락의 PIP 관절
+            
+            # 손가락이 펼쳐져 있으면 tip이 pip보다 위에 있음
+            if tip.y < pip.y - FINGER_FOLD_THRESHOLD:
+                open_count += 1
+        
+        # 엄지 확인 (엄지는 좌우 방향으로 접힘)
+        thumb_tip = hand_landmarks.landmark[4]
+        thumb_mcp = hand_landmarks.landmark[2]  # 엄지 MCP 관절
+        
+        # 손의 방향에 따라 엄지가 펼쳐져 있는지 확인
+        wrist = hand_landmarks.landmark[0]
+        index_mcp = hand_landmarks.landmark[5]
+        is_right_hand = index_mcp.x > wrist.x
+        
+        if is_right_hand:
+            thumb_open = thumb_tip.x > thumb_mcp.x - FINGER_FOLD_THRESHOLD
+        else:
+            thumb_open = thumb_tip.x < thumb_mcp.x + FINGER_FOLD_THRESHOLD
+        
+        # 4개 손가락이 모두 펼쳐져 있고 엄지도 펼쳐져 있으면 완전히 펼친 손
+        return open_count >= 4 and thumb_open
+
     def _detect_price_adjustment_gesture(self, hand_landmarks):
         """가격 조정 제스처 감지"""
         idx_y = hand_landmarks.landmark[8].y
@@ -1073,8 +1935,8 @@ class TossGestureHTS:
         if not results.multi_hand_landmarks:
             self.right_fist_start = None
             self.left_fist_start = None
-            self.right_progress.set_progress(0)
-            self.left_progress.set_progress(0)
+            self._update_button_progress("BUY", 0.0)
+            self._update_button_progress("SELL", 0.0)
             return
         
         now = time.time()
@@ -1087,19 +1949,7 @@ class TossGestureHTS:
             label = handedness.classification[0].label
             
             if self._is_fist_closed(hand_landmarks):
-                if label == "Right":
-                    if self.right_fist_start is None:
-                        self.right_fist_start = now
-                    
-                    elapsed = now - self.right_fist_start
-                    right_progress_val = min(1.0, elapsed / FIST_HOLD_DURATION)
-                    
-                    if elapsed >= FIST_HOLD_DURATION:
-                        self.execute_trade("BUY")
-                        self.right_fist_start = None
-                        right_progress_val = 0
-                        
-                elif label == "Left":
+                if label == "Left":  # 왼손 = 매수
                     if self.left_fist_start is None:
                         self.left_fist_start = now
                     
@@ -1107,28 +1957,51 @@ class TossGestureHTS:
                     left_progress_val = min(1.0, elapsed / FIST_HOLD_DURATION)
                     
                     if elapsed >= FIST_HOLD_DURATION:
-                        self.execute_trade("SELL")
+                        self.execute_trade("BUY")
                         self.left_fist_start = None
                         left_progress_val = 0
+                        
+                elif label == "Right":  # 오른손 = 매도
+                    if self.right_fist_start is None:
+                        self.right_fist_start = now
+                    
+                    elapsed = now - self.right_fist_start
+                    right_progress_val = min(1.0, elapsed / FIST_HOLD_DURATION)
+                    
+                    if elapsed >= FIST_HOLD_DURATION:
+                        self.execute_trade("SELL")
+                        self.right_fist_start = None
+                        right_progress_val = 0
             else:
-                if label == "Right":
-                    self.right_fist_start = None
-                elif label == "Left":
+                if label == "Left":
                     self.left_fist_start = None
+                elif label == "Right":
+                    self.right_fist_start = None
                 
-                gesture = self._detect_price_adjustment_gesture(hand_landmarks)
-                if gesture == "UP":
-                    self.order_amount = max(0, self.order_amount + PRICE_STEP)
-                    self.ent_order.delete(0, 'end')
-                    self.ent_order.insert(0, str(int(self.order_amount)))
-                elif gesture == "DOWN":
-                    self.order_amount = max(0, self.order_amount - PRICE_STEP)
-                    self.ent_order.delete(0, 'end')
-                    self.ent_order.insert(0, str(int(self.order_amount)))
+                # 완전히 펼친 손 제스처 감지 (현재가로 지정가 설정)
+                if self._is_hand_open(hand_landmarks):
+                    if now - self.last_open_hand_time > self.OPEN_HAND_COOLDOWN:
+                        if self.current_price > 0:
+                            self.order_amount = int(self.current_price)
+                            self.ent_order.delete(0, 'end')
+                            self.ent_order.insert(0, str(self.order_amount))
+                            self.last_open_hand_time = now
+                            self.show_toast(f"지정가를 현재가로 설정: {self.current_price:,.2f}$", "#3182F6")
+                else:
+                    # 가격 조정 제스처 (검지/중지)
+                    gesture = self._detect_price_adjustment_gesture(hand_landmarks)
+                    if gesture == "UP":
+                        self.order_amount = max(0, self.order_amount + PRICE_STEP)
+                        self.ent_order.delete(0, 'end')
+                        self.ent_order.insert(0, str(int(self.order_amount)))
+                    elif gesture == "DOWN":
+                        self.order_amount = max(0, self.order_amount - PRICE_STEP)
+                        self.ent_order.delete(0, 'end')
+                        self.ent_order.insert(0, str(int(self.order_amount)))
         
-        # 진행도 업데이트
-        self.right_progress.set_progress(right_progress_val)
-        self.left_progress.set_progress(left_progress_val)
+        # 진행도 업데이트 (버튼 테두리로 표시)
+        self._update_button_progress("BUY", left_progress_val)
+        self._update_button_progress("SELL", right_progress_val)
 
     def main_loop(self):
         """메인 루프 (카메라 처리)"""
@@ -1152,8 +2025,8 @@ class TossGestureHTS:
             else:
                 self.right_fist_start = None
                 self.left_fist_start = None
-                self.right_progress.set_progress(0)
-                self.left_progress.set_progress(0)
+                self._update_button_progress("BUY", 0.0)
+                self._update_button_progress("SELL", 0.0)
             
             img = Image.fromarray(rgb_frame)
             img_resized = img.resize((CAM_W, CAM_H), Image.Resampling.LANCZOS)
