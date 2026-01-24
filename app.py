@@ -5,6 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 import yfinance as yf
+import winsound
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
@@ -269,7 +270,7 @@ class TossGestureHTS:
         if os.path.isfile(icon_file):
             self.root.iconbitmap(icon_file)
 
-        self.root.title("Toss Invest Pro")
+        self.root.title("SFlick-HTS")
         self.root.geometry("1500x950")
         self.root.configure(bg=COLOR_BG)
         
@@ -298,10 +299,7 @@ class TossGestureHTS:
         self.stock_prices = {}  # 주식별 가격 캐시: symbol -> price
         
         # 종목 선택 메뉴 상태
-        self.stock_menu = None
-        self.stock_menu_visible = False
-        self.stock_logos = {}  # 로고 이미지 캐시
-        self.filtered_stocks = TOP_STOCKS  # 필터링된 종목 리스트
+        self.stock_menu_window = None
         
         self.current_interval = "1d" 
         self.fetch_period = "max"     
@@ -395,13 +393,13 @@ class TossGestureHTS:
             cursor="hand2"
         )
         self.lbl_symbol.pack(side='left')
-        self.lbl_symbol.bind("<Button-1>", lambda e: self._toggle_stock_menu(card, symbol_container))
+        self.lbl_symbol.bind("<Button-1>", lambda e: self._show_stock_menu())
         
         # 드롭다운 화살표 버튼
         self.dropdown_btn = tk.Canvas(symbol_container, width=24, height=24, bg=COLOR_CARD, highlightthickness=0)
         self.dropdown_btn.pack(side='left', padx=(8, 0))
         self._draw_dropdown_arrow(self.dropdown_btn, False)
-        self.dropdown_btn.bind("<Button-1>", lambda e: self._toggle_stock_menu(card, symbol_container))
+        self.dropdown_btn.bind("<Button-1>", lambda e: self._show_stock_menu())
         self.dropdown_btn.config(cursor="hand2")
         
         self.lbl_price = tk.Label(
@@ -410,6 +408,59 @@ class TossGestureHTS:
             bg=COLOR_CARD, fg=COLOR_TOSS_RED
         )
         self.lbl_price.place(x=28, y=65)
+        
+        # 현재가 버튼 (카드 맨 오른쪽 아래 - 토스 스타일 둥근 사각형)
+        current_price_canvas = tk.Canvas(
+            card, width=100, height=28, bg=COLOR_CARD, 
+            highlightthickness=0, cursor="hand2"
+        )
+        current_price_canvas.place(relx=0.95, rely=0.9, anchor='se')
+        
+        # 둥근 사각형 배경 그리기
+        def draw_rounded_btn(canvas, is_hover=False):
+            canvas.delete("all")
+            color = COLOR_TOSS_BLUE if not is_hover else "#2E6CCE"
+            w, h = 100, 28
+            radius = 6
+            
+            # 둥근 모서리
+            canvas.create_arc(0, 0, radius*2, radius*2, start=90, extent=90, fill=color, outline="")
+            canvas.create_arc(w-radius*2, 0, w, radius*2, start=0, extent=90, fill=color, outline="")
+            canvas.create_arc(w-radius*2, h-radius*2, w, h, start=270, extent=90, fill=color, outline="")
+            canvas.create_arc(0, h-radius*2, radius*2, h, start=180, extent=90, fill=color, outline="")
+            
+            # 중앙 사각형
+            canvas.create_rectangle(radius, 0, w-radius, h, fill=color, outline="")
+            canvas.create_rectangle(0, radius, w, h-radius, fill=color, outline="")
+            
+            # 텍스트
+            canvas.create_text(w/2, h/2, text="현재가로 설정", 
+                             fill=COLOR_TEXT_MAIN, font=("Malgun Gothic", 8, "bold"))
+        
+        draw_rounded_btn(current_price_canvas)
+        
+        # 호버 효과
+        def on_enter(e):
+            draw_rounded_btn(current_price_canvas, True)
+        
+        def on_leave(e):
+            draw_rounded_btn(current_price_canvas, False)
+        
+        def on_click(e):
+            self._apply_current_price()
+        
+        current_price_canvas.bind("<Enter>", on_enter)
+        current_price_canvas.bind("<Leave>", on_leave)
+        current_price_canvas.bind("<Button-1>", on_click)
+        
+        # 오른쪽 맨위에 티커 심볼 표시 (작고 회색)
+        self.lbl_ticker = tk.Label(
+            card, text=self.symbol,
+            font=("Malgun Gothic", 9),
+            bg=COLOR_CARD, fg=COLOR_TEXT_SUB,
+            anchor='e'
+        )
+        self.lbl_ticker.place(relx=0.92, y=15, anchor='ne')
         
         self.lbl_change = tk.Label(
             card, text="+0.00 (+0.00%)", 
@@ -447,302 +498,152 @@ class TossGestureHTS:
         
         canvas.create_polygon(points, fill=COLOR_TEXT_SUB, outline="")
     
-    def _toggle_stock_menu(self, parent_card, anchor_widget):
-        """종목 선택 메뉴 토글"""
-        if self.stock_menu_visible:
-            self._hide_stock_menu()
-        else:
-            self._show_stock_menu(parent_card, anchor_widget)
-    
-    def _show_stock_menu(self, parent_card, anchor_widget):
-        """종목 선택 메뉴 표시"""
-        if self.stock_menu_visible:
-            return
+    def _show_stock_menu(self):
+        """주식 선택 창 표시"""
+        if hasattr(self, 'stock_menu_window') and self.stock_menu_window:
+            try:
+                self.stock_menu_window.lift()
+                self.stock_menu_window.focus()
+                return
+            except:
+                pass
         
-        # 독립적인 창 생성
+        # 새 창 생성
         self.stock_menu_window = tk.Toplevel(self.root)
         self.stock_menu_window.title("주식 선택")
-        self.stock_menu_window.geometry("340x600")
+        self.stock_menu_window.geometry("350x500")
         self.stock_menu_window.configure(bg=COLOR_BG)
         self.stock_menu_window.resizable(False, False)
-        self.stock_menu_window.transient(self.root)
-        self.stock_menu_window.grab_set()
-        self.stock_menu_window.iconbitmap(resource_path("toss.ico"))
+        
+        try:
+            self.stock_menu_window.iconbitmap(resource_path("toss.ico"))
+        except:
+            pass
         
         # 창 닫기 이벤트
         self.stock_menu_window.protocol("WM_DELETE_WINDOW", self._hide_stock_menu)
         
-        # 메뉴 프레임
-        menu_frame = RoundedFrame(self.stock_menu_window, bg_color=COLOR_CARD, corner_radius=16)
-        menu_frame.pack(fill='both', expand=True, padx=12, pady=12)
+        # 메인 프레임
+        main_frame = tk.Frame(self.stock_menu_window, bg=COLOR_BG)
+        main_frame.pack(fill='both', expand=True, padx=12, pady=12)
         
-        # 상단 헤더 (제목 + 검색 버튼)
-        self.header_frame = tk.Frame(menu_frame, bg=COLOR_CARD)
-        self.header_frame.pack(fill='x', padx=20, pady=(16, 12))
-        
-        title_label = tk.Label(
-            self.header_frame, text="주식 선택",
-            font=("Malgun Gothic", 18, "bold"),
-            bg=COLOR_CARD, fg=COLOR_TEXT_MAIN
+        # 헤더
+        header = tk.Label(
+            main_frame, text="주식 선택",
+            font=("Malgun Gothic", 16, "bold"),
+            bg=COLOR_BG, fg=COLOR_TEXT_MAIN
         )
-        title_label.pack(side='left')
+        header.pack(fill='x', pady=(0, 12))
         
-        # 검색 버튼 (토스틱 디자인)
-        self.search_button = tk.Canvas(
-            self.header_frame, width=36, height=36, bg=COLOR_CARD, highlightthickness=0
-        )
-        self.search_button.pack(side='right')
-        self._draw_search_button(self.search_button, False)
-        self.search_button.bind("<Button-1>", lambda e: self._toggle_search())
+        # 검색 프레임
+        search_frame = tk.Frame(main_frame, bg=COLOR_BG)
+        search_frame.pack(fill='x', pady=(0, 12))
         
-        # 검색 필드 (기본 숨김)
-        self.search_frame = tk.Frame(menu_frame, bg=COLOR_CARD)
-        self.search_frame.pack_propagate(False)
-        
-        # 검색 입력 필드 배경
-        search_bg = tk.Frame(self.search_frame, bg="#2C353F", height=36)
-        search_bg.pack(fill='x', padx=20, pady=(0, 12))
-        search_bg.pack_propagate(False)
-        
-        self.search_entry = tk.Entry(
-            search_bg,
+        search_entry = tk.Entry(
+            search_frame,
             font=("Malgun Gothic", 11),
-            bg="#2C353F",
+            bg=COLOR_CARD,
             fg=COLOR_TEXT_MAIN,
             insertbackground=COLOR_TOSS_BLUE,
             bd=0,
             relief='flat'
         )
-        self.search_entry.pack(fill='both', expand=True, padx=14, pady=8)
+        search_entry.pack(fill='x', ipady=8, padx=2)
         
-        def on_search_change(e=None):
-            query = self.search_entry.get().lower()
-            if not query:
-                self.filtered_stocks = TOP_STOCKS
-            else:
-                self.filtered_stocks = [
-                    stock for stock in TOP_STOCKS
-                    if query in stock[0].lower() or query in stock[1].lower()
-                ]
-            self._update_stock_list()
+        # 종목 리스트 프레임
+        list_frame = tk.Frame(main_frame, bg=COLOR_BG)
+        list_frame.pack(fill='both', expand=True)
         
-        self.search_entry.bind("<KeyRelease>", on_search_change)
+        # 스크롤바가 있는 Listbox
+        scrollbar = tk.Scrollbar(list_frame, bg=COLOR_BG, troughcolor=COLOR_CARD)
+        scrollbar.pack(side='right', fill='y')
         
-        # 스크롤 컨테이너
-        scroll_container = tk.Frame(menu_frame, bg=COLOR_CARD)
-        scroll_container.pack(fill='both', expand=True, padx=16, pady=(0, 12))
-        
-        # 캔버스 (배경색 명시)
-        menu_canvas = tk.Canvas(scroll_container, bg=COLOR_CARD, highlightthickness=0, 
-                                highlightbackground=COLOR_CARD)
-        menu_canvas.pack(side="left", fill="both", expand=True)
-        
-        # 스크롤바 (톤 스타일 적용)
-        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=menu_canvas.yview,
-                                 style='Toss.Vertical.TScrollbar')
-        scrollbar.pack(side="right", fill="y", padx=(4, 0))
-        
-        # 스크롤 가능한 프레임
-        scrollable_frame = tk.Frame(menu_canvas, bg=COLOR_CARD)
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: menu_canvas.configure(scrollregion=menu_canvas.bbox("all"))
+        listbox = tk.Listbox(
+            list_frame,
+            font=("Malgun Gothic", 11),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_MAIN,
+            selectbackground=COLOR_TOSS_BLUE,
+            selectforeground=COLOR_TEXT_MAIN,
+            bd=0,
+            highlightthickness=0,
+            yscrollcommand=scrollbar.set
         )
+        listbox.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=listbox.yview)
         
-        menu_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        menu_canvas.configure(yscrollcommand=scrollbar.set)
+        # 초기 항목 추가
+        all_stocks = []
+        for name, symbol, logo in TOP_STOCKS:
+            all_stocks.append((f"{logo} {name} ({symbol})", symbol, name))
+            listbox.insert(tk.END, f"{logo} {name} ({symbol})")
         
-        # 마우스 휠 스크롤
-        def _on_mousewheel(event):
-            menu_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        menu_canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.all_stocks = all_stocks
         
-        # 종목 목록 생성
-        self.menu_canvas = menu_canvas
-        self.scrollable_frame = scrollable_frame
-        self.filtered_stocks = TOP_STOCKS
-        self._update_stock_list()
+        # 검색 기능
+        def update_list(e=None):
+            query = search_entry.get().lower().strip()
+            listbox.delete(0, tk.END)
+            
+            for display, symbol, name in all_stocks:
+                if not query or query in display.lower():
+                    listbox.insert(tk.END, display)
         
-        self.stock_menu_visible = True
+        search_entry.bind('<KeyRelease>', update_list)
+        
+        # 항목 선택 이벤트
+        def on_select(e=None):
+            selection = listbox.curselection()
+            if not selection:
+                return
+            
+            idx = selection[0]
+            display_text = listbox.get(idx)
+            
+            # 선택된 항목에서 symbol과 name 찾기
+            for display, symbol, name in all_stocks:
+                if display == display_text:
+                    self._switch_stock(symbol, name)
+                    break
+            
+            self._hide_stock_menu()
+        
+        listbox.bind('<Button-1>', on_select)
+        listbox.bind('<Return>', on_select)
+        
+        self.stock_menu_window.lift()
+        search_entry.focus()
+
     
-    def _draw_search_button(self, canvas, active):
-        """검색 버튼 그리기 (토스틱 스타일)"""
-        canvas.delete("all")
-        bg_color = COLOR_BUTTON_ACTIVE if active else COLOR_BUTTON_INACTIVE
-        
-        # 둥근 배경
-        canvas.create_oval(2, 2, 34, 34, fill=bg_color, outline="")
-        
-        # 🔍 텍스트
-        canvas.create_text(18, 18, text="🔍", font=("Segoe UI", 14), fill="white")
-    
-    def _toggle_search(self):
-        """검색 필드 토글"""
-        if self.search_frame.winfo_ismapped():
-            self.search_frame.pack_forget()
-            self._draw_search_button(self.search_button, False)
-            # 검색 초기화
-            self.filtered_stocks = TOP_STOCKS
-            self._update_stock_list()
-        else:
-            self.search_frame.pack(fill='x', after=self.header_frame, padx=0, pady=0)
-            self._draw_search_button(self.search_button, True)
-            self.search_entry.delete(0, 'end')
-            self.search_entry.focus()
-    
-    def _update_stock_list(self):
-        """종목 목록 업데이트"""
-        if not hasattr(self, 'scrollable_frame') or not self.scrollable_frame:
-            return
-        
-        # 기존 위젯 제거
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        
-        for i, (name, symbol, logo_url) in enumerate(self.filtered_stocks):
-            item_frame = tk.Frame(self.scrollable_frame, bg=COLOR_CARD)
-            item_frame.pack(fill='x', padx=0, pady=8)
-            
-            # 호버 효과를 위한 바인딩
-            def on_enter(e, frame=item_frame):
-                frame.config(bg="#252D37")
-                for child in frame.winfo_children():
-                    try:
-                        if isinstance(child, tk.Frame):
-                            child.config(bg="#252D37")
-                            for subchild in child.winfo_children():
-                                if isinstance(subchild, tk.Label):
-                                    subchild.config(bg="#252D37")
-                    except:
-                        pass
-            
-            def on_leave(e, frame=item_frame):
-                frame.config(bg=COLOR_CARD)
-                for child in frame.winfo_children():
-                    try:
-                        if isinstance(child, tk.Frame):
-                            child.config(bg=COLOR_CARD)
-                            for subchild in child.winfo_children():
-                                if isinstance(subchild, tk.Label):
-                                    subchild.config(bg=COLOR_CARD)
-                    except:
-                        pass
-            
-            item_frame.bind("<Enter>", on_enter)
-            item_frame.bind("<Leave>", on_leave)
-            
-            # 로고 이미지 (왼쪽)
-            logo_frame = tk.Frame(item_frame, bg=COLOR_CARD, width=44, height=44)
-            logo_frame.pack(side='left', padx=(12, 12), pady=0)
-            logo_frame.pack_propagate(False)
-            
-            logo_label = tk.Label(logo_frame, bg=COLOR_CARD)
-            logo_label.pack(expand=True, fill='both')
-            
-            # 로고 표시 (이모지)
-            if logo_url:
-                logo_label.config(text=logo_url, font=("Segoe UI", 18), fg=COLOR_TEXT_SUB)
-            else:
-                logo_label.config(text="📈", font=("Segoe UI", 18), fg=COLOR_TEXT_SUB)
-            
-            # 텍스트 정보 (오른쪽)
-            text_frame = tk.Frame(item_frame, bg=COLOR_CARD)
-            text_frame.pack(side='left', fill='both', expand=True, padx=(0, 16))
-            
-            # 종목명
-            name_label = tk.Label(
-                text_frame, text=name,
-                font=("Malgun Gothic", 12, "bold"),
-                bg=COLOR_CARD, fg=COLOR_TEXT_MAIN,
-                anchor='w'
-            )
-            name_label.pack(fill='x', pady=(6, 2))
-            name_label.bind("<Enter>", lambda e, f=item_frame: on_enter(e, f))
-            name_label.bind("<Leave>", lambda e, f=item_frame: on_leave(e, f))
-            
-            # 심볼
-            symbol_label = tk.Label(
-                text_frame, text=symbol,
-                font=("Malgun Gothic", 10),
-                bg=COLOR_CARD, fg=COLOR_TEXT_SUB,
-                anchor='w'
-            )
-            symbol_label.pack(fill='x', pady=(0, 6))
-            symbol_label.bind("<Enter>", lambda e, f=item_frame: on_enter(e, f))
-            symbol_label.bind("<Leave>", lambda e, f=item_frame: on_leave(e, f))
-            
-            # 클릭 이벤트
-            def on_click(e, s=symbol, n=name):
-                self._switch_stock(s, n)
-                self._hide_stock_menu()
-            
-            item_frame.bind("<Button-1>", on_click)
-            logo_label.bind("<Button-1>", on_click)
-            name_label.bind("<Button-1>", on_click)
-            symbol_label.bind("<Button-1>", on_click)
-            item_frame.config(cursor="hand2")
-            logo_label.config(cursor="hand2")
-            name_label.config(cursor="hand2")
-            symbol_label.config(cursor="hand2")
-        
-        self.menu_canvas.update_idletasks()
-        self.menu_canvas.configure(scrollregion=self.menu_canvas.bbox("all"))
-    
-    def _load_logo(self, label, url, symbol):
-        """로고 이미지 로드"""
-        if symbol in self.stock_logos:
-            label.config(image=self.stock_logos[symbol])
-            return
-        
-        # 기본 이미지 설정
-        default_img = Image.new('RGB', (32, 32), color=COLOR_DIVIDER)
-        default_photo = ImageTk.PhotoImage(default_img.resize((32, 32)))
-        label.config(image=default_photo)
-        label.image = default_photo
-        
-        # 백그라운드에서 로고 로드
-        def load_logo_async():
-            try:
-                if requests is None:
-                    return
-                
-                response = requests.get(url, timeout=2)
-                if response.status_code == 200:
-                    img = Image.open(BytesIO(response.content))
-                    img = img.convert('RGBA')
-                    
-                    # 투명 배경 처리
-                    background = Image.new('RGBA', img.size, COLOR_CARD)
-                    img = Image.alpha_composite(background, img)
-                    
-                    img = img.resize((32, 32), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(img)
-                    
-                    self.stock_logos[symbol] = photo
-                    self.root.after(0, lambda: label.config(image=photo) or setattr(label, 'image', photo))
-            except Exception as e:
-                # 로고 로드 실패 시 기본 아이콘 사용
-                pass
-        
-        threading.Thread(target=load_logo_async, daemon=True).start()
-    
-    def _create_custom_scrollbar(self, parent, canvas):
-        """토스틱 커스텀 스크롤바 생성"""
-        # 더 이상 사용하지 않음
-        pass
     
     def _draw_currency_button(self, canvas):
-        """화폐 전환 버튼 그리기"""
+        """화폐 전환 버튼 그리기 (토스식 둥근 사각형)"""
         canvas.delete("all")
-        w, h = 50, 32
+        w, h = 40, 23
+        radius = 6
         
-        # 버튼 배경
-        canvas.create_rectangle(0, 0, w, h, fill=COLOR_DIVIDER, outline=COLOR_DIVIDER, width=0)
+        # 배경 색상
+        bg_color = COLOR_TOSS_BLUE
+        
+        # 둥근 사각형 그리기
+        # 네 모서리 원호
+        canvas.create_arc(0, 0, radius*2, radius*2, start=90, extent=90, 
+                         fill=bg_color, outline="")
+        canvas.create_arc(w-radius*2, 0, w, radius*2, start=0, extent=90, 
+                         fill=bg_color, outline="")
+        canvas.create_arc(w-radius*2, h-radius*2, w, h, start=270, extent=90, 
+                         fill=bg_color, outline="")
+        canvas.create_arc(0, h-radius*2, radius*2, h, start=180, extent=90, 
+                         fill=bg_color, outline="")
+        
+        # 중앙 사각형
+        canvas.create_rectangle(radius, 0, w-radius, h, fill=bg_color, outline="")
+        canvas.create_rectangle(0, radius, w, h-radius, fill=bg_color, outline="")
         
         # 현재 화폐 표시
         currency_text = "KRW" if self.current_currency == CURRENCY_KRW else "USD"
-        canvas.create_text(w/2, h/2, text=currency_text, fill=COLOR_TOSS_BLUE, 
-                          font=("Malgun Gothic", 9, "bold"))
+        canvas.create_text(w/2, h/2, text=currency_text, fill="white", 
+                          font=("Malgun Gothic", 8, "bold"))
     
     def _toggle_currency(self, event=None):
         """화폐 단위 전환"""
@@ -774,6 +675,7 @@ class TossGestureHTS:
         self._update_order_currency_label()
         self._update_holdings_display()
         self._update_price_display()  # 현재가도 업데이트
+        self.update_chart_view()  # 그래프 업데이트
         self._draw_currency_button(self.currency_btn)
     
     def _update_order_currency_label(self):
@@ -849,44 +751,48 @@ class TossGestureHTS:
                 bg=COLOR_CARD, fg=COLOR_TEXT_SUB
             )
             lbl.pack(fill='x', padx=5, pady=3)
-            return
-        
-        # 6개 초과일 때 스크롤바 표시
-        if len(self.holdings) > 6:
-            self.holdings_scrollbar.pack(side='right', fill='y', padx=(2, 0))
         else:
-            self.holdings_scrollbar.pack_forget()
-        
-        # 보유 종목을 1줄씩 표시 (심볼 | 수량 | 평가가)
-        for symbol, quantity in self.holdings.items():
-            current_price = self.stock_prices.get(symbol, 0)
-            eval_price_krw = current_price * quantity * self.krw_usd_rate
-            
-            if self.current_currency == CURRENCY_KRW:
-                eval_display = f"₩{eval_price_krw:,.0f}"
+            # 6개 초과일 때 스크롤바 표시
+            if len(self.holdings) > 6:
+                self.holdings_scrollbar_canvas.pack(side='right', fill='y', padx=(2, 0))
             else:
-                eval_display = f"${current_price * quantity:,.1f}"
+                self.holdings_scrollbar_canvas.pack_forget()
             
-            # 한 줄: [심볼 (수량주)] [평가가]
-            text = f"{symbol}({quantity:,.0f}주)  {eval_display}"
-            
-            lbl = tk.Label(
-                self.holdings_frame, text=text,
-                font=("Malgun Gothic", 8),
-                bg=COLOR_DIVIDER, fg=COLOR_TEXT_MAIN,
-                anchor='w', justify='left',
-                padx=4, pady=2
-            )
-            lbl.pack(fill='x', padx=2, pady=1)
-    
+            # 보유 종목을 1줄씩 표시 (심볼 | 수량 | 평가가)
+            for symbol, quantity in self.holdings.items():
+                current_price = self.stock_prices.get(symbol, 0)
+                eval_price_krw = current_price * quantity * self.krw_usd_rate
+                
+                if self.current_currency == CURRENCY_KRW:
+                    eval_display = f"₩{eval_price_krw:,.0f}"
+                else:
+                    eval_display = f"${current_price * quantity:,.1f}"
+                
+                # 한 줄: [심볼 (수량주)] [평가가]
+                text = f"{symbol}({quantity:,.0f}주)  {eval_display}"
+                
+                lbl = tk.Label(
+                    self.holdings_frame, text=text,
+                    font=("Malgun Gothic", 8),
+                    bg=COLOR_DIVIDER, fg=COLOR_TEXT_MAIN,
+                    anchor='w', justify='left',
+                    padx=4, pady=2
+                )
+                lbl.pack(fill='x', padx=2, pady=1)
+        
+        # Canvas 업데이트 (중요!)
+        self.holdings_frame.update_idletasks()
+        self.holdings_canvas.configure(scrollregion=self.holdings_canvas.bbox("all"))
+        self._update_holdings_scrollbar_display()
+
     def _hide_stock_menu(self):
-        """종목 선택 메뉴 숨기기"""
-        if hasattr(self, 'stock_menu_window') and self.stock_menu_window:
-            self.stock_menu_window.destroy()
-            self.stock_menu_window = None
-        self.stock_menu_visible = False
-        self.filtered_stocks = TOP_STOCKS  # 필터 초기화
-        self._draw_dropdown_arrow(self.dropdown_btn, False)
+        """주식 선택 창 닫기"""
+        try:
+            if hasattr(self, 'stock_menu_window') and self.stock_menu_window:
+                self.stock_menu_window.destroy()
+                self.stock_menu_window = None
+        except:
+            pass
     
     def _switch_stock(self, symbol, name):
         """주식 전환"""
@@ -897,8 +803,9 @@ class TossGestureHTS:
         if hasattr(self, 'lbl_symbol'):
             self.lbl_symbol.config(text=name)
         
-        # 메뉴 닫기
-        self._hide_stock_menu()
+        # 가격 카드의 티커 업데이트
+        if hasattr(self, 'lbl_ticker'):
+            self.lbl_ticker.config(text=symbol)
         
         # 현재 주기 텍스트 찾기
         current_text = "일봉"
@@ -909,7 +816,45 @@ class TossGestureHTS:
         
         # 데이터 로드
         self.change_unit(self.current_interval, current_text)
-
+        
+        # 현재가를 주문가에 자동 설정 (백그라운드에서 현재가를 가져온 후 업데이트)
+        def set_current_price():
+            try:
+                ticker = yf.Ticker(symbol)
+                data = ticker.history(period="1d", interval="1m")
+                if not data.empty:
+                    current_price = float(data['Close'].iloc[-1])
+                    self.root.after(0, lambda: self._set_order_price(current_price))
+            except Exception as e:
+                print(f"Error fetching current price: {e}")
+        
+        threading.Thread(target=set_current_price, daemon=True).start()
+    
+    def _set_order_price(self, price):
+        """주문가 필드에 현재가 설정 (정수로만)"""
+        if hasattr(self, 'ent_order'):
+            self.ent_order.delete(0, 'end')
+            self.ent_order.insert(0, f"{int(price):,}")
+    
+    def _apply_current_price(self):
+        """현재가 버튼 클릭 - 현재가를 주문가에 설정 (화폐 단위 고려)"""
+        try:
+            ticker = yf.Ticker(self.symbol)
+            data = ticker.history(period="1d", interval="1m")
+            if not data.empty:
+                current_price_usd = float(data['Close'].iloc[-1])
+                
+                # 화폐 단위에 따라 변환
+                if self.current_currency == CURRENCY_KRW:
+                    display_price = current_price_usd * self.krw_usd_rate
+                else:
+                    display_price = current_price_usd
+                
+                self._set_order_price(display_price)
+                self.show_toast(f"현재가 {display_price:,.2f}로 설정", COLOR_TOSS_BLUE)
+        except Exception as e:
+            self.show_toast("현재가를 가져올 수 없습니다", "#6B7684")
+    
     def _create_asset_card(self):
         """자산 정보 카드 생성 (토스 스타일) - 좌우 분할 레이아웃"""
         card = RoundedFrame(self.side_panel, height=130, corner_radius=20)
@@ -931,7 +876,7 @@ class TossGestureHTS:
         
         # 화폐 전환 버튼
         self.currency_btn = tk.Canvas(
-            card, width=48, height=28, bg=COLOR_CARD, highlightthickness=0
+            card, width=40, height=23, bg=COLOR_CARD, highlightthickness=0
         )
         self.currency_btn.place(x=20, y=90)
         self._draw_currency_button(self.currency_btn)
@@ -1099,9 +1044,9 @@ class TossGestureHTS:
         self.lbl_order_currency.place(relx=0.5, y=30, anchor='center')
         
         self.ent_order = tk.Entry(
-            card, font=("Segoe UI", 28, "bold"), 
+            card, font=("Segoe UI", 20, "bold"), 
             bg=COLOR_CARD, fg=COLOR_TOSS_BLUE, 
-            bd=0, justify='center', width=10,
+            bd=0, justify='center', width=16,
             insertbackground=COLOR_TOSS_BLUE
         )
         self.ent_order.place(relx=0.5, y=75, anchor='center')
@@ -1274,6 +1219,10 @@ class TossGestureHTS:
         self.chart_widget.bind("<Motion>", self.on_chart_hover)
         self.chart_widget.bind("<MouseWheel>", self.on_chart_scroll)
         self.chart_widget.bind("<Leave>", self.on_chart_leave)
+        self.chart_widget.bind("<Button-1>", self.on_chart_click)
+        
+        # 하이라이트된 가격 저장
+        self.highlighted_price = None
 
         # 하단 컨트롤 생성
         self._create_controls()
@@ -1671,20 +1620,42 @@ class TossGestureHTS:
         self.ax.axhline(y=high_max, color=COLOR_TOSS_RED, linestyle='--', alpha=0.6, linewidth=1)
         self.ax.axhline(y=low_min, color=COLOR_TOSS_BLUE, linestyle='--', alpha=0.6, linewidth=1)
         
-        # 최고가 최저가 텍스트 표시
-        self.ax.text(len(visible_df) - 1, high_max, f'HIGH {high_max:.2f}', 
+        # 최고가 최저가 텍스트 표시 (화폐 반영)
+        if self.current_currency == CURRENCY_KRW:
+            high_text = f'HIGH ₩{high_max * self.krw_usd_rate:,.0f}'
+            low_text = f'LOW ₩{low_min * self.krw_usd_rate:,.0f}'
+        else:
+            high_text = f'HIGH ${high_max:.2f}'
+            low_text = f'LOW ${low_min:.2f}'
+        
+        self.ax.text(len(visible_df) - 1, high_max, high_text, 
                     color=COLOR_TOSS_RED, fontsize=8, ha='right', va='bottom', 
                     bbox=dict(boxstyle="round,pad=0.2", facecolor=COLOR_CARD, edgecolor=COLOR_TOSS_RED, alpha=0.8))
-        self.ax.text(len(visible_df) - 1, low_min, f'LOW {low_min:.2f}', 
+        self.ax.text(len(visible_df) - 1, low_min, low_text, 
                     color=COLOR_TOSS_BLUE, fontsize=8, ha='right', va='top', 
                     bbox=dict(boxstyle="round,pad=0.2", facecolor=COLOR_CARD, edgecolor=COLOR_TOSS_BLUE, alpha=0.8))
         
         if highlight_idx is not None and 0 <= highlight_idx < len(visible_df):
+            # 수직선 그리기
             self.ax.axvline(x=highlight_idx, color=COLOR_TEXT_SUB, alpha=0.3, 
                           linestyle='--', linewidth=1)
+            
+            # 전체 그래프의 색상 결정 (라인 차트 기준: 첫/마지막 종가 비교)
+            if len(y_data) > 0:
+                chart_color = COLOR_TOSS_RED if y_data[-1] >= y_data[0] else COLOR_TOSS_BLUE
+            else:
+                chart_color = COLOR_TOSS_RED
+            
+            # 그래프와 만나는 지점에 점 그리기 (그래프 색상 반영)
+            close_price = visible_df['Close'].iloc[highlight_idx]
+            self.ax.scatter([highlight_idx], [close_price], color=chart_color, s=100, zorder=5, edgecolors='white', linewidth=1)
+            
+            # 하이라이트된 인덱스와 가격을 저장
+            self.highlighted_price = close_price
 
         self._apply_chart_style()
         self.canvas_agg.draw()
+
 
     def _draw_candlestick(self, visible_df, x_indices, v_min, margin):
         """캔들스틱 차트 그리기"""
@@ -1771,12 +1742,25 @@ class TossGestureHTS:
             else:
                 date_str = row.name.strftime("%Y-%m-%d")
 
-            # 툴팁 텍스트 갱신
+            # 툴팁 텍스트 갱신 (화폐 반영)
             self.lbl_tt_date.config(text=date_str)
-            self.lbl_tt_open.config(text=f"{row['Open']:,.2f}")
-            self.lbl_tt_high.config(text=f"{row['High']:,.2f}")
-            self.lbl_tt_low.config(text=f"{row['Low']:,.2f}")
-            self.lbl_tt_close.config(text=f"{row['Close']:,.2f}")
+            
+            # 화폐에 따라 가격 포맷
+            if self.current_currency == CURRENCY_KRW:
+                open_val = f"₩{row['Open'] * self.krw_usd_rate:,.0f}"
+                high_val = f"₩{row['High'] * self.krw_usd_rate:,.0f}"
+                low_val = f"₩{row['Low'] * self.krw_usd_rate:,.0f}"
+                close_val = f"₩{row['Close'] * self.krw_usd_rate:,.0f}"
+            else:
+                open_val = f"${row['Open']:,.2f}"
+                high_val = f"${row['High']:,.2f}"
+                low_val = f"${row['Low']:,.2f}"
+                close_val = f"${row['Close']:,.2f}"
+            
+            self.lbl_tt_open.config(text=open_val)
+            self.lbl_tt_high.config(text=high_val)
+            self.lbl_tt_low.config(text=low_val)
+            self.lbl_tt_close.config(text=close_val)
             
             # 거래량 포맷팅 (천/백만/십억 단위)
             volume = int(row['Volume'])
@@ -1827,12 +1811,32 @@ class TossGestureHTS:
         self.tooltip.place_forget()
         self.update_chart_view()
 
+    def on_chart_click(self, event):
+        """차트 클릭 - 현재 하이라이트된 가격을 주문가로 설정"""
+        if self.highlighted_price is None or self.df.empty:
+            return
+        
+        try:
+            # 화폐 단위에 따라 변환
+            if self.current_currency == CURRENCY_KRW:
+                display_price = self.highlighted_price * self.krw_usd_rate
+            else:
+                display_price = self.highlighted_price
+            
+            self._set_order_price(display_price)
+            self.show_toast(f"차트의 가격 {display_price:,.0f}로 설정", COLOR_TOSS_BLUE)
+        except Exception as e:
+            self.show_toast("가격 설정에 실패했습니다", "#6B7684")
+
     def execute_trade(self, side):
         """거래 실행"""
         try:
-            order_price = float(self.ent_order.get())
+            # 쉼표 제거 후 float로 변환
+            order_price_str = self.ent_order.get().replace(',', '')
+            order_price = float(order_price_str)
         except ValueError:
             self.show_toast("올바른 가격을 입력하세요", "#6B7684")
+            winsound.Beep(400, 200)  # 에러 소리
             return
         
         # 현재 화폐 설정에 따라 원화로 변환
@@ -1849,8 +1853,12 @@ class TossGestureHTS:
                 self.stock_prices[self.symbol] = order_price
                 display_price = f"{order_price:,.2f}"
                 self.show_toast(f"{display_price} 매수 완료", COLOR_TOSS_RED)
+                # 매수 성공 소리
+                winsound.Beep(800, 100)
+                winsound.Beep(1000, 100)
             else:
                 self.show_toast("잔액이 부족합니다", "#6B7684")
+                winsound.Beep(400, 200)  # 에러 소리
                 
         elif side == "SELL":
             if self.holdings.get(self.symbol, 0) > 0:
@@ -1860,8 +1868,12 @@ class TossGestureHTS:
                     del self.holdings[self.symbol]
                 display_price = f"{order_price:,.2f}"
                 self.show_toast(f"{display_price} 매도 완료", COLOR_TOSS_BLUE)
+                # 매도 성공 소리
+                winsound.Beep(1000, 100)
+                winsound.Beep(800, 100)
             else:
                 self.show_toast("보유 주식이 없습니다", "#6B7684")
+                winsound.Beep(400, 200)  # 에러 소리
         
         self._update_balance_display()
         self._update_holdings_display()
